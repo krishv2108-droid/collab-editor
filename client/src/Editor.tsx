@@ -87,9 +87,7 @@ export function Editor({ docId }: { docId: string }) {
 
   return (
     <div style={{ maxWidth: 720, margin: "2rem auto", fontFamily: "system-ui, sans-serif" }}>
-      <h1 style={{ fontSize: "1.25rem" }}>
-        Document <code>{docId}</code> <small>({status})</small>
-      </h1>
+      <h1 style={{ fontSize: "1.25rem" }}>Collab Editor</h1>
       {message && (
         <p
           role="status"
