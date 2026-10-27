@@ -60,6 +60,14 @@ describe.skipIf(skip)("PostgresStore specifics", () => {
     await expect(store.load("doc")).rejects.toThrow(/Corrupt operation/);
   });
 
+  it("keeps edits saved before the author column existed, with no author", async () => {
+    await pool.query(`INSERT INTO documents (id, head_revision) VALUES ('old', 1)`);
+    await pool.query(`INSERT INTO operations (doc_id, revision, op) VALUES ('old', 1, '[{"type":"insert","text":"hi"}]'::jsonb)`);
+    expect(await store.operationsSince("old", 0)).toEqual([
+      { revision: 1, op: [insert("hi")], author: null },
+    ]);
+  });
+
   it("the database itself refuses a duplicate revision, even if the code check were missing", async () => {
     await store.append("doc", 1, [insert("abc")]);
     await expect(

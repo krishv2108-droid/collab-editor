@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { insert, retain } from "./operation";
-import { parseClientMessage, parseServerMessage } from "./protocol";
+import { MAX_CLIENT_ID_LENGTH, parseClientMessage, parseServerMessage } from "./protocol";
 
 const edit = (baseRevision: unknown, op: unknown) =>
   JSON.stringify({ type: "edit", baseRevision, op });
@@ -11,6 +11,29 @@ describe("parseClientMessage", () => {
       type: "join",
       docId: "abc",
     });
+  });
+
+  it("accepts a join that identifies the tab and what it has seen", () => {
+    const message = { type: "join", docId: "abc", clientId: "tab-1", lastRevision: 7 };
+    expect(parseClientMessage(JSON.stringify(message))).toEqual(message);
+    expect(parseClientMessage('{"type":"join","docId":"abc","clientId":"tab-1"}')).toEqual({
+      type: "join",
+      docId: "abc",
+      clientId: "tab-1",
+    });
+  });
+
+  it("rejects a join with a bad clientId or lastRevision", () => {
+    const join = (extra: object) => JSON.stringify({ type: "join", docId: "abc", ...extra });
+    expect(parseClientMessage(join({ clientId: "" }))).toBeNull();
+    expect(parseClientMessage(join({ clientId: 5 }))).toBeNull();
+    expect(parseClientMessage(join({ clientId: "x".repeat(MAX_CLIENT_ID_LENGTH + 1) }))).toBeNull();
+    expect(parseClientMessage(join({ clientId: "x".repeat(MAX_CLIENT_ID_LENGTH) }))).not.toBeNull();
+    expect(parseClientMessage(join({ clientId: "a", lastRevision: -1 }))).toBeNull();
+    expect(parseClientMessage(join({ clientId: "a", lastRevision: 1.5 }))).toBeNull();
+    expect(parseClientMessage(join({ clientId: "a", lastRevision: "3" }))).toBeNull();
+    // A revision without a clientId can't be answered with "which of these are yours".
+    expect(parseClientMessage(join({ lastRevision: 3 }))).toBeNull();
   });
 
   it("accepts a valid edit", () => {
@@ -63,6 +86,35 @@ describe("parseServerMessage", () => {
     expect(parseServerMessage('{"type":"snapshot","revision":1}')).toBeNull();
     expect(parseServerMessage('{"type":"snapshot","text":"hi"}')).toBeNull();
     expect(parseServerMessage('{"type":"snapshot","text":"hi","revision":-1}')).toBeNull();
+  });
+
+  it("accepts a catchup", () => {
+    const message = {
+      type: "catchup",
+      operations: [
+        { op: [insert("x")], own: false },
+        { op: [retain(1), insert("y")], own: true },
+      ],
+      revision: 9,
+    };
+    expect(parseServerMessage(JSON.stringify(message))).toEqual(message);
+    expect(parseServerMessage('{"type":"catchup","operations":[],"revision":0}')).toEqual({
+      type: "catchup",
+      operations: [],
+      revision: 0,
+    });
+  });
+
+  it("rejects a malformed catchup", () => {
+    const catchup = (operations: unknown, revision: unknown = 1) =>
+      JSON.stringify({ type: "catchup", operations, revision });
+    expect(parseServerMessage(catchup("nope"))).toBeNull();
+    expect(parseServerMessage(catchup([null]))).toBeNull();
+    expect(parseServerMessage(catchup([{ op: [insert("x")] }]))).toBeNull(); // no `own`
+    expect(parseServerMessage(catchup([{ op: [insert("x")], own: "yes" }]))).toBeNull();
+    expect(parseServerMessage(catchup([{ op: "bad", own: true }]))).toBeNull();
+    expect(parseServerMessage(catchup([], -1))).toBeNull();
+    expect(parseServerMessage(catchup([], 1.5))).toBeNull();
   });
 
   it("accepts an ack", () => {

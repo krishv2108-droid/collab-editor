@@ -1,11 +1,16 @@
 import type { Operation } from "@collab/shared";
-import { RevisionConflictError, type DocumentStore, type StoredDocument } from "./DocumentStore";
+import {
+  RevisionConflictError,
+  type DocumentStore,
+  type StoredDocument,
+  type StoredOperation,
+} from "./DocumentStore";
 
 interface Entry {
   snapshotText: string;
   snapshotRevision: number;
   /** Every edit ever appended: operations[i] produced revision i + 1. */
-  operations: Operation[];
+  operations: { op: Operation; author: string | null }[];
 }
 
 /**
@@ -22,11 +27,11 @@ export class InMemoryStore implements DocumentStore {
     return structuredClone({
       snapshotText: entry.snapshotText,
       snapshotRevision: entry.snapshotRevision,
-      operations: entry.operations.slice(entry.snapshotRevision),
+      operations: entry.operations.slice(entry.snapshotRevision).map((saved) => saved.op),
     });
   }
 
-  async append(docId: string, revision: number, op: Operation): Promise<void> {
+  async append(docId: string, revision: number, op: Operation, author?: string): Promise<void> {
     const head = this.docs.get(docId)?.operations.length ?? 0;
     if (revision !== head + 1) throw new RevisionConflictError(docId, revision);
 
@@ -35,7 +40,17 @@ export class InMemoryStore implements DocumentStore {
       entry = { snapshotText: "", snapshotRevision: 0, operations: [] };
       this.docs.set(docId, entry);
     }
-    entry.operations.push(structuredClone(op));
+    entry.operations.push({ op: structuredClone(op), author: author ?? null });
+  }
+
+  async operationsSince(docId: string, afterRevision: number): Promise<StoredOperation[]> {
+    const saved = this.docs.get(docId)?.operations ?? [];
+    if (afterRevision > saved.length) {
+      throw new RangeError(`"${docId}" has no revision ${afterRevision} (it is at ${saved.length})`);
+    }
+    return saved.slice(afterRevision).map((entry, index) =>
+      structuredClone({ revision: afterRevision + index + 1, op: entry.op, author: entry.author }),
+    );
   }
 
   async saveSnapshot(docId: string, revision: number, text: string): Promise<void> {

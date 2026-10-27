@@ -51,9 +51,11 @@ export function useDocumentSocket(docId: string, handlers: Handlers) {
         setStatus("ready");
       } else if (message.type === "ack") {
         handlersRef.current.onAck();
-      } else {
+      } else if (message.type === "edit") {
         handlersRef.current.onRemoteEdit(message.op);
       }
+      // "catchup" is only sent to tabs that ask for it by rejoining with a lastRevision,
+      // which this client doesn't do yet (reconnect step 4).
     };
     socket.onclose = () => setStatus("disconnected");
 

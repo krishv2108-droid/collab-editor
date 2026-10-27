@@ -1,5 +1,5 @@
 import type { Operation } from "@collab/shared";
-import type { DocumentStore, StoredDocument } from "./DocumentStore";
+import type { DocumentStore, StoredDocument, StoredOperation } from "./DocumentStore";
 import { InMemoryStore } from "./InMemoryStore";
 
 /**
@@ -14,6 +14,7 @@ export class FlakyStore implements DocumentStore {
   delayMs = 0;
   failNextLoad = false;
   failNextAppend = false;
+  failNextOperationsSince = false;
   snapshotCalls = 0;
   /** Snapshots are slow independently of the other operations, so tests can catch them mid-save. */
   snapshotDelayMs = 0;
@@ -33,14 +34,23 @@ export class FlakyStore implements DocumentStore {
     return this.inner.load(docId);
   }
 
-  async append(docId: string, revision: number, op: Operation): Promise<void> {
+  async append(docId: string, revision: number, op: Operation, author?: string): Promise<void> {
     this.appendCalls++;
     await this.pause();
     if (this.failNextAppend) {
       this.failNextAppend = false;
       throw new Error("simulated append failure");
     }
-    return this.inner.append(docId, revision, op);
+    return this.inner.append(docId, revision, op, author);
+  }
+
+  async operationsSince(docId: string, afterRevision: number): Promise<StoredOperation[]> {
+    await this.pause();
+    if (this.failNextOperationsSince) {
+      this.failNextOperationsSince = false;
+      throw new Error("simulated operationsSince failure");
+    }
+    return this.inner.operationsSince(docId, afterRevision);
   }
 
   async saveSnapshot(docId: string, revision: number, text: string): Promise<void> {

@@ -12,6 +12,9 @@ const MAX_MESSAGE_BYTES = 1024 * 1024;
 // WebSocket close codes: 1008 = the client broke the rules, 1011 = the server had a problem.
 const CLOSE_POLICY_VIOLATION = 1008;
 const CLOSE_INTERNAL_ERROR = 1011;
+// An application-defined code (4000-4999 are ours to use): the same tab connected again, so
+// this older connection was dropped. A client that sees it must not reconnect.
+const CLOSE_REPLACED = 4001;
 
 function send(socket: WebSocket, message: ServerMessage): void {
   if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
@@ -34,6 +37,9 @@ export function createCollabServer(
   const wss = new WebSocketServer({ port, maxPayload: MAX_MESSAGE_BYTES });
   const registry = new DocumentRegistry<WebSocket>(store, {
     snapshotEvery: options.snapshotEvery,
+    onClientReplaced(client) {
+      client.close(CLOSE_REPLACED, "Replaced by a newer connection");
+    },
     onRoomFailed(clients, error) {
       console.error(error.message);
       // Their view of the document can no longer be trusted. Disconnect them so they
@@ -45,8 +51,16 @@ export function createCollabServer(
   async function handleMessage(socket: WebSocket, message: ClientMessage): Promise<void> {
     if (message.type === "join") {
       try {
-        const snapshot = await registry.join(message.docId, socket);
-        if (snapshot) send(socket, { type: "snapshot", ...snapshot });
+        const joined = await registry.join(message.docId, socket, {
+          clientId: message.clientId,
+          lastRevision: message.lastRevision,
+        });
+        if (!joined) return;
+        if (joined.missed) {
+          send(socket, { type: "catchup", operations: joined.missed, revision: joined.revision });
+        } else {
+          send(socket, { type: "snapshot", text: joined.text, revision: joined.revision });
+        }
       } catch (error) {
         console.error("Could not load document:", (error as Error).message);
         socket.close(CLOSE_INTERNAL_ERROR, "Could not load document");

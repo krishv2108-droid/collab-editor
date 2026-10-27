@@ -1,7 +1,12 @@
 import type pg from "pg";
 import { isOperation, type Operation } from "@collab/shared";
 import { withTransaction } from "./db";
-import { RevisionConflictError, type DocumentStore, type StoredDocument } from "./DocumentStore";
+import {
+  RevisionConflictError,
+  type DocumentStore,
+  type StoredDocument,
+  type StoredOperation,
+} from "./DocumentStore";
 
 /**
  * Saves documents in Postgres as a snapshot plus an append-only log of operations.
@@ -50,7 +55,7 @@ export class PostgresStore implements DocumentStore {
    * nothing) unless `revision` is exactly one more than the document's latest revision.
    * Creates the document on its first edit (revision 1).
    */
-  async append(docId: string, revision: number, op: Operation): Promise<void> {
+  async append(docId: string, revision: number, op: Operation, author?: string): Promise<void> {
     await withTransaction(this.pool, async (client) => {
       await client.query("INSERT INTO documents (id) VALUES ($1) ON CONFLICT (id) DO NOTHING", [
         docId,
@@ -63,12 +68,39 @@ export class PostgresStore implements DocumentStore {
         [docId, revision],
       );
       if (moved.rowCount === 0) throw new RevisionConflictError(docId, revision);
-      await client.query("INSERT INTO operations (doc_id, revision, op) VALUES ($1, $2, $3)", [
-        docId,
-        revision,
-        JSON.stringify(op),
-      ]);
+      await client.query(
+        "INSERT INTO operations (doc_id, revision, op, author) VALUES ($1, $2, $3, $4)",
+        [docId, revision, JSON.stringify(op), author ?? null],
+      );
     });
+  }
+
+  /** Every edit after `afterRevision`, with its author. Throws RangeError if the document isn't that far along. */
+  async operationsSince(docId: string, afterRevision: number): Promise<StoredOperation[]> {
+    return withTransaction(
+      this.pool,
+      async (client) => {
+        const doc = await client.query<{ head_revision: number }>(
+          "SELECT head_revision FROM documents WHERE id = $1",
+          [docId],
+        );
+        const head = doc.rows[0]?.head_revision ?? 0;
+        if (afterRevision > head) {
+          throw new RangeError(`"${docId}" has no revision ${afterRevision} (it is at ${head})`);
+        }
+        const ops = await client.query<{ revision: number; op: unknown; author: string | null }>(
+          "SELECT revision, op, author FROM operations WHERE doc_id = $1 AND revision > $2 ORDER BY revision",
+          [docId, afterRevision],
+        );
+        return ops.rows.map((row) => {
+          if (!isOperation(row.op)) {
+            throw new Error(`Corrupt operation stored for "${docId}" at revision ${row.revision}`);
+          }
+          return { revision: row.revision, op: row.op, author: row.author };
+        });
+      },
+      "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+    );
   }
 
   /**

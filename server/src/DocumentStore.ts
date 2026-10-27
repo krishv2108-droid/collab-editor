@@ -19,6 +19,15 @@ export interface StoredDocument {
   operations: Operation[];
 }
 
+/** One saved edit, with who made it. */
+export interface StoredOperation {
+  /** The revision this edit produced. */
+  revision: number;
+  op: Operation;
+  /** The clientId of the tab that made it, or null if unknown (old data, or an anonymous client). */
+  author: string | null;
+}
+
 /**
  * Where documents are kept between server restarts. The rest of the server only knows
  * this interface, so it can run on Postgres in production and on memory in fast tests.
@@ -32,8 +41,16 @@ export interface DocumentStore {
    * Records the edit that produced `revision`. Throws RevisionConflictError (and saves
    * nothing) unless `revision` is exactly one more than the document's latest revision.
    * The first edit of a document is revision 1, and that creates the document.
+   * `author` is remembered with the edit; see operationsSince.
    */
-  append(docId: string, revision: number, op: Operation): Promise<void>;
+  append(docId: string, revision: number, op: Operation, author?: string): Promise<void>;
+
+  /**
+   * Every edit after `afterRevision`, in order, with its author. Empty if there are none
+   * (and for a document that was never saved, when `afterRevision` is 0). Throws RangeError
+   * if `afterRevision` is ahead of the document, which means the caller is out of step with it.
+   */
+  operationsSince(docId: string, afterRevision: number): Promise<StoredOperation[]>;
 
   /**
    * Stores `text` as the document's text at `revision`, so loading can skip the edits up

@@ -224,4 +224,103 @@ describe("collab server", () => {
     expect(alice.text).toBe("XXabcY");
     expect(bob.text).toBe("XXabcY");
   });
+  describe("reconnecting", () => {
+    const hello = [insert("hello")];
+
+    it("catches a returning tab up, and says its own saved edit was its own", async () => {
+      const alice = await connect();
+      alice.send({ type: "join", docId: "doc1", clientId: "alice" });
+      await alice.next(); // snapshot
+      const bob = await join("doc1");
+
+      alice.send({ type: "edit", baseRevision: 0, op: hello });
+      await bob.next(); // bob got it, so it is saved
+      alice.close(); // her ack is lost with the connection
+      bob.send({ type: "edit", baseRevision: 1, op: [retain(5), insert("!")] });
+      await bob.next(); // ack
+
+      const again = await connect();
+      again.send({ type: "join", docId: "doc1", clientId: "alice", lastRevision: 0 });
+      expect(await again.next()).toEqual({
+        type: "catchup",
+        operations: [
+          { op: hello, own: true },
+          { op: [retain(5), insert("!")], own: false },
+        ],
+        revision: 2,
+      });
+
+      // And she is in the room again: bob's next edit reaches her.
+      bob.send({ type: "edit", baseRevision: 2, op: [retain(6), insert("?")] });
+      expect(await again.next()).toEqual({ type: "edit", op: [retain(6), insert("?")] });
+    });
+
+    it("sends a snapshot to a tab that didn't say what it has seen", async () => {
+      const bob = await join("doc1");
+      bob.send({ type: "edit", baseRevision: 0, op: hello });
+      await bob.next();
+
+      const carol = await connect();
+      carol.send({ type: "join", docId: "doc1", clientId: "carol" });
+      expect(await carol.next()).toEqual({ type: "snapshot", text: "hello", revision: 1 });
+    });
+
+    it("closes the older connection of a tab that connects again, with a code that means 'don't retry'", async () => {
+      const first = await connect();
+      first.send({ type: "join", docId: "doc1", clientId: "tab" });
+      await first.next();
+
+      const second = await connect();
+      second.send({ type: "join", docId: "doc1", clientId: "tab", lastRevision: 0 });
+      await second.next();
+      expect(await first.closed).toBe(4001);
+    });
+
+    it("converges end to end: a tab that lost the connection mid-edit, in both ways it can go wrong", async () => {
+      for (const reachedServer of [true, false]) {
+        const docId = `doc-${reachedServer}`;
+        const bob = await join(docId);
+        const aliceSocket = await connect();
+        aliceSocket.send({ type: "join", docId, clientId: "alice" });
+        const first = await aliceSocket.next();
+        if (first.type !== "snapshot") throw new Error("expected a snapshot");
+        const alice = { text: first.text, sync: new ClientSync(first.revision) };
+
+        // Alice types "Y"; depending on the loop, the edit does or doesn't reach the server.
+        const op = diffToOperation(alice.text, "Y")!;
+        alice.text = "Y";
+        const outgoing = alice.sync.applyLocal(op)!;
+        if (reachedServer) {
+          aliceSocket.send({ type: "edit", ...outgoing });
+          await bob.next(); // saved and forwarded
+        }
+        aliceSocket.close();
+        // Meanwhile bob types too.
+        const bobOp = reachedServer ? [insert("B"), retain(1)] : [insert("B")];
+        bob.send({ type: "edit", baseRevision: reachedServer ? 1 : 0, op: bobOp });
+        await bob.next(); // ack
+
+        const back = await connect();
+        back.send({ type: "join", docId, clientId: "alice", lastRevision: first.revision });
+        const catchup = await back.next();
+        if (catchup.type !== "catchup") throw new Error("expected a catchup");
+        const result = alice.sync.reconnect(catchup.operations);
+        for (const remote of result.toApply) alice.text = applyOperation(alice.text, remote);
+        if (result.resend) {
+          back.send({ type: "edit", ...result.resend });
+          expect(await back.next()).toEqual({ type: "ack" });
+        }
+        // Bob hears about the resend (if any) and everyone ends with one copy of every edit.
+        if (result.resend) await bob.next();
+        // If Alice's edit was saved first, Bob's "B" lands before it. If not, both insert at
+        // the very start, and the later-arriving edit (hers) goes on the left.
+        expect(alice.text).toBe(reachedServer ? "BY" : "YB");
+        expect(result.resend !== null).toBe(!reachedServer);
+
+        const check = await connect();
+        check.send({ type: "join", docId });
+        expect(await check.next()).toMatchObject({ type: "snapshot", text: alice.text });
+      }
+    });
+  });
 });

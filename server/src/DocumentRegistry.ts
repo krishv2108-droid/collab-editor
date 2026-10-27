@@ -1,4 +1,4 @@
-import type { Operation } from "@collab/shared";
+import type { MissedOperation, Operation } from "@collab/shared";
 import type { DocumentStore } from "./DocumentStore";
 import { ServerDocument } from "./ServerDocument";
 
@@ -31,6 +31,35 @@ export interface RegistryOptions<C> {
   onRoomFailed?(clients: C[], error: RoomFailedError): void;
   /** How many edits to let pile up before saving a snapshot. Defaults to DEFAULT_SNAPSHOT_EVERY. */
   snapshotEvery?: number;
+  /**
+   * Called with an older connection that was pushed out because the same tab (same
+   * clientId) joined again from a new one. The registry has already forgotten it.
+   */
+  onClientReplaced?(client: C): void;
+}
+
+export interface JoinOptions {
+  /** The tab's own random id. It lets the registry recognise the tab's edits and its reconnects. */
+  clientId?: string;
+  /** The last revision the tab processed. With a clientId, asks for what it missed instead of a full snapshot. */
+  lastRevision?: number;
+}
+
+export interface JoinResult {
+  /** The document as it is now. */
+  text: string;
+  revision: number;
+  /**
+   * Present only for a tab that asked to be caught up and could be: every edit saved after
+   * its `lastRevision`, in order, with the ones it made itself marked. Absent means "send
+   * the whole snapshot instead".
+   */
+  missed?: MissedOperation[];
+}
+
+interface Membership<C> {
+  room: Room<C>;
+  clientId: string | undefined;
 }
 
 /**
@@ -61,7 +90,7 @@ interface Room<C> {
 export class DocumentRegistry<C> {
   private readonly rooms = new Map<string, Room<C>>();
   /** Which room each client is in (or is in the middle of joining). */
-  private readonly memberships = new Map<C, { room: Room<C> }>();
+  private readonly memberships = new Map<C, Membership<C>>();
   private readonly pendingSnapshots = new Set<Promise<void>>();
   private readonly snapshotEvery: number;
 
@@ -74,15 +103,21 @@ export class DocumentRegistry<C> {
 
   /**
    * Puts `client` in document `docId`, loading it from the store if nobody else has it
-   * open. Resolves with what to snapshot to the client, or null if the client left or
-   * moved to another document before this finished. Rejects if the document can't be loaded.
+   * open. Resolves with the document as it is now (and, for a tab that is reconnecting, the
+   * edits it missed), or null if the client left or moved to another document before this
+   * finished. Rejects if the document can't be loaded.
+   *
+   * A tab that joins with a clientId replaces any other connection of the same tab in this
+   * document. Edits that older connection had already handed to us are saved first, so they
+   * show up as the tab's own in `missed`; anything it sends afterwards is refused. That is
+   * what stops a half-dead connection from saving an edit the tab has already sent again.
    */
-  async join(docId: string, client: C): Promise<{ text: string; revision: number } | null> {
+  async join(docId: string, client: C, options: JoinOptions = {}): Promise<JoinResult | null> {
     this.leave(client); // a client can only be in one document at a time
 
     for (;;) {
       const room = this.roomFor(docId);
-      const membership = { room };
+      const membership: Membership<C> = { room, clientId: options.clientId };
       this.memberships.set(client, membership);
 
       try {
@@ -90,8 +125,20 @@ export class DocumentRegistry<C> {
           if (room.evicted) return "retry" as const;
           const document = await room.document;
           if (this.memberships.get(client) !== membership) return null; // left in the meantime
+
+          if (options.clientId !== undefined) {
+            this.replaceOlderConnections(room, client, options.clientId);
+          }
+          const missed =
+            options.clientId !== undefined && options.lastRevision !== undefined
+              ? await this.missedSince(room, document, options.clientId, options.lastRevision)
+              : undefined;
+          if (this.memberships.get(client) !== membership) return null; // left while we looked
+
           room.clients.add(client);
-          return { text: document.text, revision: document.revision };
+          const joined: JoinResult = { text: document.text, revision: document.revision };
+          if (missed) joined.missed = missed;
+          return joined;
         });
         if (result !== "retry") return result;
       } catch (error) {
@@ -141,7 +188,7 @@ export class DocumentRegistry<C> {
 
       const edit = document.prepare(baseRevision, op); // throws on bad input, changing nothing
       try {
-        await this.store.append(room.docId, edit.revision, edit.op);
+        await this.store.append(room.docId, edit.revision, edit.op, membership.clientId);
       } catch (cause) {
         throw this.failRoom(room, cause);
       }
@@ -211,6 +258,40 @@ export class DocumentRegistry<C> {
         this.pendingSnapshots.delete(saving);
       });
     this.pendingSnapshots.add(saving);
+  }
+
+  /** Forgets every other connection of the same tab in this room and tells the owner of the registry. */
+  private replaceOlderConnections(room: Room<C>, client: C, clientId: string): void {
+    for (const [other, membership] of this.memberships) {
+      if (other === client || membership.room !== room || membership.clientId !== clientId) continue;
+      this.memberships.delete(other);
+      room.clients.delete(other);
+      this.options.onClientReplaced?.(other);
+    }
+  }
+
+  /**
+   * The edits saved after `lastRevision`, each marked with whether `clientId` made it, or
+   * undefined if we can't give a trustworthy list (the tab claims a revision the document
+   * never reached, or the stored log doesn't add up), in which case the tab gets a snapshot.
+   * Rejects if the store itself fails: guessing would risk losing the tab's offline edits.
+   */
+  private async missedSince(
+    room: Room<C>,
+    document: ServerDocument,
+    clientId: string,
+    lastRevision: number,
+  ): Promise<MissedOperation[] | undefined> {
+    if (lastRevision > document.revision) return undefined;
+    let saved;
+    try {
+      saved = await this.store.operationsSince(room.docId, lastRevision);
+    } catch (error) {
+      if (error instanceof RangeError) return undefined;
+      throw error;
+    }
+    if (saved.length !== document.revision - lastRevision) return undefined;
+    return saved.map(({ op, author }) => ({ op, own: author === clientId }));
   }
 
   private async loadDocument(docId: string): Promise<ServerDocument> {

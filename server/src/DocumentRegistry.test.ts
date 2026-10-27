@@ -174,6 +174,109 @@ describe("DocumentRegistry", () => {
     });
   });
 
+  describe("reconnecting", () => {
+    it("tells a returning tab which edits it missed, marking its own", async () => {
+      await registry.join("doc1", "alice-1", { clientId: "alice" });
+      await registry.join("doc1", "bob", { clientId: "bob" });
+      await registry.applyEdit("alice-1", 0, [insert("abc")]);
+      await registry.applyEdit("bob", 1, [insert("X"), retain(3)]);
+      registry.leave("alice-1"); // her connection drops
+      await registry.applyEdit("bob", 2, [retain(4), insert("Y")]);
+
+      const joined = await registry.join("doc1", "alice-2", { clientId: "alice", lastRevision: 0 });
+      expect(joined).toEqual({
+        text: "XabcY",
+        revision: 3,
+        missed: [
+          { op: [insert("abc")], own: true },
+          { op: [insert("X"), retain(3)], own: false },
+          { op: [retain(4), insert("Y")], own: false },
+        ],
+      });
+    });
+
+    it("reports nothing missed for a tab that is already up to date", async () => {
+      await store.inner.append("doc1", 1, [insert("abc")]);
+      const joined = await registry.join("doc1", "alice", { clientId: "alice", lastRevision: 1 });
+      expect(joined).toEqual({ text: "abc", revision: 1, missed: [] });
+    });
+
+    it("gives a plain snapshot unless the tab both identifies itself and says what it has seen", async () => {
+      await store.inner.append("doc1", 1, [insert("abc")]);
+      const anonymous = await registry.join("doc1", "a");
+      const noRevision = await registry.join("doc1", "b", { clientId: "b" });
+      expect(anonymous).toEqual({ text: "abc", revision: 1 });
+      expect(noRevision).toEqual({ text: "abc", revision: 1 });
+      expect("missed" in anonymous!).toBe(false);
+      expect("missed" in noRevision!).toBe(false);
+    });
+
+    it("falls back to a snapshot for a tab that claims a revision the document never reached", async () => {
+      await store.inner.append("doc1", 1, [insert("abc")]);
+      const joined = await registry.join("doc1", "alice", { clientId: "alice", lastRevision: 5 });
+      expect(joined).toEqual({ text: "abc", revision: 1 });
+    });
+
+    it("saves who made each edit", async () => {
+      await registry.join("doc1", "alice", { clientId: "tab-a" });
+      await registry.join("doc1", "bob");
+      await registry.applyEdit("alice", 0, [insert("abc")]);
+      await registry.applyEdit("bob", 1, [retain(3), insert("!")]);
+      expect((await store.inner.operationsSince("doc1", 0)).map((saved) => saved.author)).toEqual([
+        "tab-a",
+        null,
+      ]);
+    });
+
+    it("pushes out an older connection of the same tab, and refuses what it sends afterwards", async () => {
+      const replaced: string[] = [];
+      registry = new DocumentRegistry<string>(store, { onClientReplaced: (c) => replaced.push(c) });
+      await registry.join("doc1", "old", { clientId: "tab" });
+      await registry.join("doc1", "bob", { clientId: "bob" });
+      await registry.join("doc1", "new", { clientId: "tab", lastRevision: 0 });
+
+      expect(replaced).toEqual(["old"]);
+      expect(registry.clientCount("doc1")).toBe(2);
+      await expect(registry.applyEdit("old", 0, [insert("late")])).rejects.toThrow();
+      const result = await registry.applyEdit("bob", 0, [insert("hi")]);
+      expect(result.recipients).toEqual(["new"]);
+    });
+
+    it("counts an edit the older connection had already handed over as saved, not as lost", async () => {
+      await registry.join("doc1", "old", { clientId: "tab" });
+      await registry.join("doc1", "bob", { clientId: "bob" });
+      store.delayMs = 20; // the edit is still being saved when the new connection arrives
+      const saving = registry.applyEdit("old", 0, [insert("abc")]);
+      const joined = await registry.join("doc1", "new", { clientId: "tab", lastRevision: 0 });
+      await saving;
+
+      expect(joined!.missed).toEqual([{ op: [insert("abc")], own: true }]);
+      expect(joined!.revision).toBe(1);
+    });
+
+    it("leaves alone other tabs, and the same tab id in another document", async () => {
+      const replaced: string[] = [];
+      registry = new DocumentRegistry<string>(store, { onClientReplaced: (c) => replaced.push(c) });
+      await registry.join("doc1", "a", { clientId: "tab-a" });
+      await registry.join("doc1", "b", { clientId: "tab-b" });
+      await registry.join("doc2", "c", { clientId: "tab-a" });
+      expect(replaced).toEqual([]);
+      expect(registry.clientCount("doc1")).toBe(2);
+    });
+
+    it("rejects the join, rather than guessing, if the store can't list what was missed", async () => {
+      await store.inner.append("doc1", 1, [insert("abc")]);
+      store.failNextOperationsSince = true;
+      await expect(
+        registry.join("doc1", "alice", { clientId: "alice", lastRevision: 0 }),
+      ).rejects.toThrow(/simulated/);
+      expect(registry.clientCount("doc1")).toBe(0);
+
+      const retry = await registry.join("doc1", "alice", { clientId: "alice", lastRevision: 0 });
+      expect(retry!.missed).toEqual([{ op: [insert("abc")], own: false }]);
+    });
+  });
+
   describe("persistence", () => {
     it("a brand new registry on the same store sees everything the old one saved", async () => {
       await registry.join("doc1", "alice");

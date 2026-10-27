@@ -10,6 +10,19 @@ export interface Outgoing {
 
 export type SyncState = "synchronized" | "awaiting" | "awaitingWithBuffer";
 
+/** An operation the server saved while we were disconnected. `own` marks the ones that came from us. */
+export interface MissedOperation {
+  op: Operation;
+  own: boolean;
+}
+
+export interface Reconnected {
+  /** Remote operations to apply to the local text, in this order. */
+  toApply: Operation[];
+  /** The operation to send again, if the server never saw it. */
+  resend: Outgoing | null;
+}
+
 /**
  * The client's half of OT. It keeps the server and the local document in step
  * while the user keeps typing and the network takes its time.
@@ -90,5 +103,30 @@ export class ClientSync {
       incoming = incomingPrime;
     }
     return incoming;
+  }
+
+  /**
+   * We lost the connection and got it back. `missed` is everything the server saved after
+   * the last revision we processed, in order. Nothing needs to happen when the connection
+   * drops: our pending operations are still valid, we just don't know whether the server
+   * got the in-flight one. The missed list tells us:
+   *   - an `own` entry is our in-flight operation after all: treat it as acknowledged;
+   *   - the others are other people's edits, handled exactly like live remote edits.
+   * Whatever is still in flight afterwards was never saved, so it is sent again, tagged
+   * with the revision we have now caught up to. Anything typed while offline stays in the
+   * buffer and goes out after that one is acknowledged, as usual.
+   */
+  reconnect(missed: MissedOperation[]): Reconnected {
+    const toApply: Operation[] = [];
+    for (const { op, own } of missed) {
+      if (own) {
+        if (this.inflight === null) throw new Error("The server has an operation of ours that we never sent");
+        this.serverAck(); // a buffer promoted to in-flight is sent below, not here
+      } else {
+        toApply.push(this.applyRemote(op));
+      }
+    }
+    const resend = this.inflight === null ? null : { baseRevision: this.revision, op: this.inflight };
+    return { toApply, resend };
   }
 }

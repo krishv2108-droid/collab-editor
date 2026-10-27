@@ -119,6 +119,63 @@ export function describeDocumentStoreContract(
       });
     });
 
+    describe("operationsSince", () => {
+      beforeEach(async () => {
+        await store.append("doc", 1, [insert("abc")], "alice");
+        await store.append("doc", 2, [insert("X"), retain(3)], "bob");
+        await store.append("doc", 3, [retain(4), insert("Y")]); // no author
+      });
+
+      it("returns the edits after a revision, in order, with their authors", async () => {
+        expect(await store.operationsSince("doc", 1)).toEqual([
+          { revision: 2, op: [insert("X"), retain(3)], author: "bob" },
+          { revision: 3, op: [retain(4), insert("Y")], author: null },
+        ]);
+      });
+
+      it("returns everything from revision 0 and nothing from the latest revision", async () => {
+        expect(await store.operationsSince("doc", 0)).toHaveLength(3);
+        expect(await store.operationsSince("doc", 3)).toEqual([]);
+      });
+
+      it("still returns edits a snapshot has made unnecessary for loading", async () => {
+        await store.saveSnapshot("doc", 3, "XabcY");
+        expect((await store.operationsSince("doc", 0)).map((saved) => saved.author)).toEqual([
+          "alice",
+          "bob",
+          null,
+        ]);
+      });
+
+      it("is empty for a document that was never saved, as long as you haven't seen any of it", async () => {
+        expect(await store.operationsSince("missing", 0)).toEqual([]);
+        await expect(store.operationsSince("missing", 1)).rejects.toThrow(RangeError);
+      });
+
+      it("rejects a revision the document hasn't reached", async () => {
+        await expect(store.operationsSince("doc", 4)).rejects.toThrow(RangeError);
+      });
+
+      it("returns copies", async () => {
+        const [first] = await store.operationsSince("doc", 0);
+        first!.op.push(insert("tampered"));
+        first!.author = "mallory";
+        expect((await store.operationsSince("doc", 0))[0]).toEqual({
+          revision: 1,
+          op: [insert("abc")],
+          author: "alice",
+        });
+      });
+
+      it("does not let an author change what load returns", async () => {
+        expect((await store.load("doc"))!.operations).toEqual([
+          [insert("abc")],
+          [insert("X"), retain(3)],
+          [retain(4), insert("Y")],
+        ]);
+      });
+    });
+
     describe("saveSnapshot", () => {
       beforeEach(async () => {
         await store.append("doc", 1, [insert("abc")]);
