@@ -1,63 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { WebSocket } from "ws";
 import {
   applyOperation,
   ClientSync,
   diffToOperation,
   insert,
-  parseServerMessage,
   retain,
-  type ClientMessage,
-  type ServerMessage,
 } from "@collab/shared";
+import { FlakyStore } from "./FlakyStore";
+import { InMemoryStore } from "./InMemoryStore";
 import { createCollabServer, type CollabServer } from "./server";
-
-/** A test WebSocket that queues incoming messages so we can await them in order. */
-class TestClient {
-  private socket: WebSocket;
-  private queue: ServerMessage[] = [];
-  private waiting: Array<(message: ServerMessage) => void> = [];
-  readonly closed: Promise<number>;
-
-  private constructor(socket: WebSocket) {
-    this.socket = socket;
-    this.closed = new Promise((resolve) => socket.once("close", (code) => resolve(code)));
-    socket.on("message", (data) => {
-      const message = parseServerMessage(data.toString());
-      if (!message) return;
-      const waiter = this.waiting.shift();
-      if (waiter) waiter(message);
-      else this.queue.push(message);
-    });
-  }
-
-  static connect(port: number): Promise<TestClient> {
-    return new Promise((resolve, reject) => {
-      const socket = new WebSocket(`ws://localhost:${port}`);
-      const client = new TestClient(socket);
-      socket.once("open", () => resolve(client));
-      socket.once("error", reject);
-    });
-  }
-
-  send(message: ClientMessage | string): void {
-    this.socket.send(typeof message === "string" ? message : JSON.stringify(message));
-  }
-
-  next(): Promise<ServerMessage> {
-    const queued = this.queue.shift();
-    if (queued) return Promise.resolve(queued);
-    return new Promise((resolve) => this.waiting.push(resolve));
-  }
-
-  get pendingCount(): number {
-    return this.queue.length;
-  }
-
-  close(): void {
-    this.socket.terminate();
-  }
-}
+import { TestClient } from "./TestClient";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -78,13 +30,23 @@ describe("collab server", () => {
     return client;
   }
 
+  const extraServers: CollabServer[] = [];
+
+  /** An additional server, for tests that need their own store or a restart. */
+  async function startServer(store: InMemoryStore | FlakyStore): Promise<CollabServer> {
+    const extra = await createCollabServer(0, store);
+    extraServers.push(extra);
+    return extra;
+  }
+
   beforeEach(async () => {
-    server = await createCollabServer(0);
+    server = await createCollabServer(0, new InMemoryStore());
   });
 
   afterEach(async () => {
     for (const client of clients.splice(0)) client.close();
     await server.close();
+    for (const extra of extraServers.splice(0)) await extra.close();
   });
 
   it("sends an empty snapshot at revision 0 when joining a new document", async () => {
@@ -157,6 +119,61 @@ describe("collab server", () => {
     await alice.next(); // ack
     await sleep(50);
     expect(bob.pendingCount).toBe(0);
+  });
+
+  it("keeps a document across a server restart", async () => {
+    const store = new InMemoryStore();
+    const first = await startServer(store);
+
+    const writer = await TestClient.connect(first.port);
+    clients.push(writer);
+    writer.send({ type: "join", docId: "doc1" });
+    await writer.next(); // snapshot
+    writer.send({ type: "edit", baseRevision: 0, op: [insert("hello")] });
+    expect(await writer.next()).toEqual({ type: "ack" }); // an ack means it has been saved
+    await first.close();
+
+    // A brand new server with an empty memory, sharing only the store.
+    const second = await startServer(store);
+    const reader = await TestClient.connect(second.port);
+    clients.push(reader);
+    reader.send({ type: "join", docId: "doc1" });
+    expect(await reader.next()).toEqual({ type: "snapshot", text: "hello", revision: 1 });
+
+    // ...and editing carries on from where it left off.
+    reader.send({ type: "edit", baseRevision: 1, op: [retain(5), insert("!")] });
+    expect(await reader.next()).toEqual({ type: "ack" });
+  });
+
+  it("disconnects everyone in a document when saving an edit fails, and never acks it", async () => {
+    const store = new FlakyStore();
+    const flaky = await startServer(store);
+    const alice = await TestClient.connect(flaky.port);
+    const bob = await TestClient.connect(flaky.port);
+    clients.push(alice, bob);
+    for (const client of [alice, bob]) {
+      client.send({ type: "join", docId: "doc1" });
+      await client.next();
+    }
+
+    store.failNextAppend = true;
+    alice.send({ type: "edit", baseRevision: 0, op: [insert("lost")] });
+
+    expect(await alice.closed).toBe(1011);
+    expect(await bob.closed).toBe(1011);
+    expect(alice.pendingCount).toBe(0); // no ack arrived before the disconnect
+    expect(await store.inner.load("doc1")).toBeNull(); // and nothing was stored
+  });
+
+  it("disconnects a client whose document can't be loaded", async () => {
+    const store = new FlakyStore();
+    const flaky = await startServer(store);
+    const alice = await TestClient.connect(flaky.port);
+    clients.push(alice);
+
+    store.failNextLoad = true;
+    alice.send({ type: "join", docId: "doc1" });
+    expect(await alice.closed).toBe(1011);
   });
 
   it("keeps two real clients converged through a conflict (the Phase 1 failure, over sockets)", async () => {

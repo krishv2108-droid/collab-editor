@@ -102,3 +102,80 @@ describe("ServerDocument", () => {
     }
   });
 });
+
+describe("ServerDocument: support for saving and restoring", () => {
+  it("restores from a snapshot plus the edits after it", () => {
+    const doc = ServerDocument.restore({
+      snapshotText: "Xabc",
+      snapshotRevision: 2,
+      operations: [[retain(4), insert("Y")]],
+    });
+    expect(doc.text).toBe("XabcY");
+    expect(doc.revision).toBe(3);
+  });
+
+  it("restores a document that has no snapshot yet", () => {
+    const doc = ServerDocument.restore({
+      snapshotText: "",
+      snapshotRevision: 0,
+      operations: [[insert("abc")], [insert("X"), retain(3)]],
+    });
+    expect(doc.text).toBe("Xabc");
+    expect(doc.revision).toBe(2);
+  });
+
+  it("refuses a restore whose stored edits don't fit", () => {
+    expect(() =>
+      ServerDocument.restore({
+        snapshotText: "",
+        snapshotRevision: 0,
+        operations: [[retain(5)]],
+      }),
+    ).toThrow(RangeError);
+  });
+
+  it("still rewrites stale edits against the history it does have", () => {
+    const doc = ServerDocument.restore({
+      snapshotText: "abc",
+      snapshotRevision: 1,
+      operations: [[insert("XX"), retain(3)]], // revision 2: "XXabc"
+    });
+    // Made against revision 1 ("abc"), the oldest revision a restored document knows.
+    expect(doc.receive(1, [retain(3), insert("Y")])).toEqual([retain(5), insert("Y")]);
+    expect(doc.text).toBe("XXabcY");
+  });
+
+  it("rejects an edit based on a revision from before the snapshot", () => {
+    const doc = ServerDocument.restore({
+      snapshotText: "abc",
+      snapshotRevision: 5,
+      operations: [],
+    });
+    expect(() => doc.receive(4, [retain(3)])).toThrow(RangeError);
+    expect(doc.receive(5, [retain(3), insert("!")])).toEqual([retain(3), insert("!")]);
+  });
+
+  it("prepare() checks and rewrites an edit without changing the document", () => {
+    const doc = new ServerDocument("abc");
+    const edit = doc.prepare(0, [retain(3), insert("!")]);
+    expect(edit).toEqual({ revision: 1, op: [retain(3), insert("!")], nextText: "abc!" });
+    expect(doc.text).toBe("abc");
+    expect(doc.revision).toBe(0);
+  });
+
+  it("commit() makes a prepared edit part of the document", () => {
+    const doc = new ServerDocument("abc");
+    doc.commit(doc.prepare(0, [retain(3), insert("!")]));
+    expect(doc.text).toBe("abc!");
+    expect(doc.revision).toBe(1);
+  });
+
+  it("refuses to commit an edit prepared before another one was committed", () => {
+    const doc = new ServerDocument("abc");
+    const first = doc.prepare(0, [retain(3), insert("1")]);
+    const second = doc.prepare(0, [retain(3), insert("2")]);
+    doc.commit(first);
+    expect(() => doc.commit(second)).toThrow(/Stale edit/);
+    expect(doc.text).toBe("abc1");
+  });
+});

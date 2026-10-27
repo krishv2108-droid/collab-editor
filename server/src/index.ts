@@ -1,5 +1,23 @@
+import { loadConfig } from "./config";
+import { createPool } from "./db";
+import { migrate } from "./migrate";
+import { PostgresStore } from "./PostgresStore";
 import { createCollabServer } from "./server";
 
-const port = Number(process.env.PORT ?? 8080);
-const server = await createCollabServer(port);
+const config = loadConfig();
+const pool = createPool(config.databaseUrl);
+
+const applied = await migrate(pool);
+if (applied.length > 0) console.log(`Applied migrations: ${applied.join(", ")}`);
+
+const server = await createCollabServer(config.port, new PostgresStore(pool));
 console.log(`Collab server listening on ws://localhost:${server.port}`);
+
+// Stop cleanly when asked to (Ctrl+C, or the dev watcher restarting us after a file change).
+async function shutdown(): Promise<void> {
+  await server.close();
+  await pool.end();
+  process.exit(0);
+}
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
