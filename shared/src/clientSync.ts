@@ -1,5 +1,6 @@
 import { compose } from "./compose";
 import type { Operation } from "./operation";
+import { transformPosition } from "./position";
 import { transform } from "./transform";
 
 /** An operation the client must send to the server, tagged with the revision it was made at. */
@@ -44,6 +45,15 @@ export class ClientSync {
 
   constructor(revision: number) {
     this.revision = revision;
+  }
+
+  /**
+   * The operation we have in flight, as the server will apply it: kept rewritten to fit the
+   * server's latest text. Read it just before serverAck() to learn exactly what the server
+   * did, which is what anything tracking positions in the server's text must replay.
+   */
+  get inflightOperation(): Operation | null {
+    return this.inflight;
   }
 
   /** How many server operations we have processed. A reconnecting tab tells the server this. */
@@ -108,6 +118,20 @@ export class ClientSync {
       incoming = incomingPrime;
     }
     return incoming;
+  }
+
+  /**
+   * Where a position in the SERVER's text is in the text the user is looking at, which also
+   * has our unacknowledged edits: the position is moved past our in-flight edit and then past
+   * our buffer. Use it to draw other users' cursors. Do not store the result: keep positions in
+   * the server's text, move them past each server edit and each of our acknowledged edits
+   * exactly as the server does, and call this when drawing. (Positions moved past the same
+   * edits in a different order can disagree, see position.test.ts.)
+   */
+  rebasePosition(position: number): number {
+    if (this.inflight !== null) position = transformPosition(position, this.inflight);
+    if (this.buffer !== null) position = transformPosition(position, this.buffer);
+    return position;
   }
 
   /**

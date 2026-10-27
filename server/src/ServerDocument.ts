@@ -1,4 +1,10 @@
-import { applyOperation, transform, type Operation } from "@collab/shared";
+import {
+  applyOperation,
+  transform,
+  transformSelection,
+  type Operation,
+  type Selection,
+} from "@collab/shared";
 import type { StoredDocument } from "./DocumentStore";
 
 /** An edit that has been checked and rewritten but not yet recorded. See prepare/commit. */
@@ -54,16 +60,7 @@ export class ServerDocument {
    * real here once it is safely stored.
    */
   prepare(baseRevision: number, op: Operation): PreparedEdit {
-    if (
-      !Number.isInteger(baseRevision) ||
-      baseRevision < this.startRevision ||
-      baseRevision > this.revision
-    ) {
-      throw new RangeError(
-        `Unknown base revision ${baseRevision} ` +
-          `(document keeps revisions ${this.startRevision} to ${this.revision})`,
-      );
-    }
+    this.assertKnownRevision(baseRevision);
 
     let rewritten = op;
     for (let revision = baseRevision; revision < this.revision; revision++) {
@@ -74,6 +71,34 @@ export class ServerDocument {
 
     const nextText = applyOperation(this.currentText, rewritten); // throws if it doesn't fit
     return { revision: this.revision + 1, op: rewritten, nextText };
+  }
+
+  /**
+   * Moves a selection made in the text of revision `baseRevision` forward to the latest
+   * text, past every edit accepted since, in the order they were accepted. Positions beyond
+   * the end are clamped. Throws RangeError if the revision isn't one we keep.
+   */
+  selectionFrom(baseRevision: number, selection: Selection): Selection {
+    this.assertKnownRevision(baseRevision);
+    let moved = selection;
+    for (let revision = baseRevision; revision < this.revision; revision++) {
+      moved = transformSelection(moved, this.history[revision - this.startRevision]!);
+    }
+    const end = this.currentText.length;
+    return { start: Math.min(moved.start, end), end: Math.min(moved.end, end) };
+  }
+
+  private assertKnownRevision(baseRevision: number): void {
+    if (
+      !Number.isInteger(baseRevision) ||
+      baseRevision < this.startRevision ||
+      baseRevision > this.revision
+    ) {
+      throw new RangeError(
+        `Unknown base revision ${baseRevision} ` +
+          `(document keeps revisions ${this.startRevision} to ${this.revision})`,
+      );
+    }
   }
 
   /** Makes a prepared edit part of the document. Must follow its prepare() with nothing in between. */

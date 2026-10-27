@@ -277,6 +277,105 @@ describe("DocumentRegistry", () => {
     });
   });
 
+  describe("cursors", () => {
+    it("remembers a cursor and says who to tell, not including its owner", async () => {
+      await registry.join("doc1", "alice");
+      await registry.join("doc1", "bob");
+      await registry.applyEdit("alice", 0, [insert("hello")]);
+
+      const moved = await registry.applyCursor("alice", 1, { start: 2, end: 4 });
+      expect(moved).toEqual({ peer: expect.any(String), selection: { start: 2, end: 4 }, recipients: ["bob"] });
+    });
+
+    it("gives each connection a different anonymous name that isn't its clientId", async () => {
+      await registry.join("doc1", "alice", { clientId: "secret-alice" });
+      await registry.join("doc1", "bob", { clientId: "secret-bob" });
+      await registry.applyEdit("alice", 0, [insert("hello")]);
+      const a = await registry.applyCursor("alice", 1, { start: 0, end: 0 });
+      const b = await registry.applyCursor("bob", 1, { start: 0, end: 0 });
+      expect(a!.peer).not.toBe(b!.peer);
+      expect([a!.peer, b!.peer]).not.toContain("secret-alice");
+    });
+
+    it("moves a cursor made on an older revision up to the latest text", async () => {
+      await registry.join("doc1", "alice");
+      await registry.join("doc1", "bob");
+      await registry.applyEdit("alice", 0, [insert("abc")]);
+      await registry.applyEdit("alice", 1, [insert("XX"), retain(3)]);
+      const moved = await registry.applyCursor("bob", 1, { start: 1, end: 2 }); // made when the text was "abc"
+      expect(moved!.selection).toEqual({ start: 3, end: 4 });
+    });
+
+    it("moves everyone's stored cursors past each edit as it is accepted", async () => {
+      await registry.join("doc1", "alice");
+      await registry.join("doc1", "bob");
+      await registry.applyEdit("alice", 0, [insert("abc")]);
+      await registry.applyCursor("bob", 1, { start: 2, end: 2 });
+      await registry.applyEdit("alice", 1, [insert("XX"), retain(3)]);
+
+      const carol = await registry.join("doc1", "carol");
+      expect(carol!.peers).toEqual([{ peer: expect.any(String), start: 4, end: 4 }]);
+    });
+
+    it("tells a newcomer where the others are, and says nothing if nobody has a cursor", async () => {
+      await registry.join("doc1", "alice");
+      expect((await registry.join("doc1", "bob"))!.peers).toBeUndefined();
+      await registry.applyCursor("alice", 0, { start: 0, end: 0 });
+      const carol = await registry.join("doc1", "carol");
+      expect(carol!.peers).toHaveLength(1);
+    });
+
+    it("ignores a cursor made on a revision the document never had, without complaint", async () => {
+      await registry.join("doc1", "alice");
+      expect(await registry.applyCursor("alice", 7, { start: 0, end: 0 })).toBeNull();
+    });
+
+    it("clamps a cursor beyond the end of the text", async () => {
+      await registry.join("doc1", "alice");
+      await registry.applyEdit("alice", 0, [insert("abc")]);
+      const moved = await registry.applyCursor("alice", 1, { start: 50, end: 60 });
+      expect(moved!.selection).toEqual({ start: 3, end: 3 });
+    });
+
+    it("rejects a cursor from a client that hasn't joined", async () => {
+      await expect(registry.applyCursor("nobody", 0, { start: 0, end: 0 })).rejects.toThrow();
+    });
+
+    it("tells the others when a user who had a cursor leaves, and stays quiet for one who didn't", async () => {
+      const gone: Array<{ recipients: string[]; peer: string }> = [];
+      registry = new DocumentRegistry<string>(store, { onPeerLeft: (recipients, peer) => gone.push({ recipients, peer }) });
+      await registry.join("doc1", "alice");
+      await registry.join("doc1", "bob");
+      await registry.join("doc1", "carol");
+      const moved = await registry.applyCursor("alice", 0, { start: 0, end: 0 });
+
+      registry.leave("bob"); // never sent a cursor
+      expect(gone).toEqual([]);
+      registry.leave("alice");
+      expect(gone).toEqual([{ recipients: ["carol"], peer: moved!.peer }]);
+    });
+
+    it("treats a connection pushed out by a newer one of the same tab as a user leaving", async () => {
+      const gone: string[] = [];
+      registry = new DocumentRegistry<string>(store, { onPeerLeft: (_recipients, peer) => gone.push(peer) });
+      await registry.join("doc1", "old", { clientId: "tab" });
+      await registry.join("doc1", "bob", { clientId: "bob" });
+      const moved = await registry.applyCursor("old", 0, { start: 0, end: 0 });
+      await registry.join("doc1", "new", { clientId: "tab", lastRevision: 0 });
+      expect(gone).toEqual([moved!.peer]);
+    });
+
+    it("orders a cursor behind the edits queued before it", async () => {
+      await registry.join("doc1", "alice");
+      await registry.join("doc1", "bob");
+      store.delayMs = 10;
+      const edit = registry.applyEdit("alice", 0, [insert("abc")]); // still being saved
+      const cursor = registry.applyCursor("bob", 0, { start: 0, end: 0 }); // made on the empty text
+      await edit;
+      expect((await cursor)!.selection).toEqual({ start: 0, end: 0 });
+    });
+  });
+
   describe("persistence", () => {
     it("a brand new registry on the same store sees everything the old one saved", async () => {
       await registry.join("doc1", "alice");

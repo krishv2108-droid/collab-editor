@@ -179,3 +179,35 @@ describe("ServerDocument: support for saving and restoring", () => {
     expect(doc.text).toBe("abc1");
   });
 });
+
+describe("ServerDocument: moving selections", () => {
+  /** "abc" at revision 1, then "Xabc" at 2, then "XabcY" at 3. */
+  function threeRevisions(): ServerDocument {
+    const doc = new ServerDocument();
+    doc.receive(0, [insert("abc")]);
+    doc.receive(1, [insert("X"), retain(3)]);
+    doc.receive(2, [retain(4), insert("Y")]);
+    return doc;
+  }
+
+  it("leaves a selection alone when it was made on the latest revision", () => {
+    expect(threeRevisions().selectionFrom(3, { start: 1, end: 4 })).toEqual({ start: 1, end: 4 });
+  });
+
+  it("moves it past every edit accepted since, in order", () => {
+    // Made at revision 1 ("abc"), around "bc"; "X" was then added in front.
+    expect(threeRevisions().selectionFrom(1, { start: 1, end: 3 })).toEqual({ start: 2, end: 4 });
+  });
+
+  it("keeps a cursor at the end of the text before something is appended there", () => {
+    expect(threeRevisions().selectionFrom(2, { start: 4, end: 4 })).toEqual({ start: 4, end: 4 });
+  });
+
+  it("clamps positions beyond the end of the text", () => {
+    expect(threeRevisions().selectionFrom(3, { start: 99, end: 100 })).toEqual({ start: 5, end: 5 });
+  });
+
+  it("rejects a revision it doesn't have", () => {
+    expect(() => threeRevisions().selectionFrom(9, { start: 0, end: 0 })).toThrow(RangeError);
+  });
+});

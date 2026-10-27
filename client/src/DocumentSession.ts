@@ -3,9 +3,12 @@ import {
   ClientSync,
   diffToOperation,
   parseServerMessage,
+  transformSelection,
   type ClientMessage,
   type Operation,
   type Outgoing,
+  type PeerCursor,
+  type Selection,
 } from "@collab/shared";
 import { backoffDelay } from "./backoff";
 
@@ -13,10 +16,9 @@ import { backoffDelay } from "./backoff";
  * - connecting:   no document yet (first visit, or the server made us start over)
  * - ready:        connected and in step with the server
  * - reconnecting: the connection dropped; we keep the document, accept typing, and retry
- * - replaced:     the server closed this connection because this tab connected again (final)
  * - outOfSync:    the server rejected one of our edits; the page needs a reload (final)
  */
-export type ConnectionStatus = "connecting" | "ready" | "reconnecting" | "replaced" | "outOfSync";
+export type ConnectionStatus = "connecting" | "ready" | "reconnecting" | "outOfSync";
 
 /** The little bit of WebSocket we use, so tests can stand in a fake one. */
 export interface SocketLike {
@@ -36,6 +38,12 @@ export interface SessionListener {
    * so the caller can move the cursor along with them.
    */
   onRemoteChange(text: string, operations: Operation[]): void;
+  /**
+   * Where the other users' cursors are, in the text the user is looking at (their own
+   * unacknowledged edits included). Called whenever any of them moves or the text changes.
+   * Empty while disconnected: positions we can't keep up to date aren't worth showing.
+   */
+  onPeersChange?(peers: PeerCursor[]): void;
 }
 
 export interface SessionOptions {
@@ -50,16 +58,21 @@ export interface SessionOptions {
   heartbeatMs?: number;
   /** How long to wait for any answer (to a ping, or to opening the connection) before giving up on it. */
   timeoutMs?: number;
+  /** The shortest time between two cursor messages. A drag-select would otherwise send one per pixel. */
+  cursorIntervalMs?: number;
 }
 
 export const DEFAULT_HEARTBEAT_MS = 10_000;
 export const DEFAULT_TIMEOUT_MS = 5_000;
+export const DEFAULT_CURSOR_INTERVAL_MS = 50;
 
 const SOCKET_OPEN = 1;
 
-// Close codes the server uses (see server.ts) that mean "reconnecting won't help".
+// The one close code from the server (see hub.ts) that means "reconnecting won't help".
+// Notably NOT the "replaced by a newer connection" code (4001): each page load has its own
+// random clientId, so the only connection that can replace ours is an older one of ours whose
+// last message reached the server late. Reconnecting is the right answer to that.
 const CLOSE_POLICY_VIOLATION = 1008;
-const CLOSE_REPLACED = 4001;
 
 /**
  * One tab's connection to one document: the socket, the OT state (ClientSync), the text,
@@ -86,10 +99,25 @@ export class DocumentSession {
   private deadlineTimer: ReturnType<typeof setTimeout> | null = null;
   private currentStatus: ConnectionStatus = "connecting";
 
+  /** The user's own cursor, in the text they are looking at. Null until they first click or type. */
+  private selection: Selection | null = null;
+  /** True when the server hasn't been told where the cursor is now. */
+  private cursorDirty = false;
+  private lastCursorSent = -Infinity;
+  private cursorTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Other users' cursors, kept in the SERVER's text (not the one on screen). Each is moved
+   * past every edit the server accepts, ours included, in the order the server accepted them:
+   * exactly what the server does with its copy, so the two can't disagree. What is drawn is
+   * this, projected through our own pending edits (see notifyPeers).
+   */
+  private peers = new Map<string, Selection>();
+
   private readonly createSocket: (url: string) => SocketLike;
   private readonly random: () => number;
   private readonly heartbeatMs: number;
   private readonly timeoutMs: number;
+  private readonly cursorIntervalMs: number;
 
   constructor(private readonly options: SessionOptions) {
     // A browser WebSocket has the same shape; the cast only smooths over its event types.
@@ -98,6 +126,7 @@ export class DocumentSession {
     this.random = options.random ?? Math.random;
     this.heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.cursorIntervalMs = options.cursorIntervalMs ?? DEFAULT_CURSOR_INTERVAL_MS;
   }
 
   get text(): string {
@@ -117,6 +146,7 @@ export class DocumentSession {
     this.stopped = true;
     this.clearTimer();
     this.clearLiveness();
+    this.clearCursorTimer();
     const socket = this.socket;
     this.socket = null;
     if (socket) {
@@ -138,8 +168,85 @@ export class DocumentSession {
     const op = diffToOperation(this.current, newText);
     this.current = newText;
     if (!op) return;
+    // Our cursor moves with our own typing, so what we remember of it must too. And the
+    // server moved its copy past this edit as IT received it (possibly rewritten against
+    // someone else's edit), which can land somewhere else: tell it again once we're in step.
+    if (this.selection) {
+      this.selection = transformSelection(this.selection, op);
+      this.cursorDirty = true;
+    }
     const outgoing = this.sync.applyLocal(op);
     if (outgoing) this.sendEdit(outgoing);
+    this.notifyPeers(); // what we have pending changed, so did where their cursors are on our screen
+  }
+
+  /**
+   * The user's cursor (or highlighted range) is now here. Call it for what the user did, not
+   * for moves the session reported through onRemoteChange: those are already accounted for,
+   * and a call that changes nothing is ignored.
+   */
+  setSelection(selection: Selection): void {
+    if (this.selection?.start === selection.start && this.selection.end === selection.end) return;
+    this.selection = selection;
+    this.cursorDirty = true;
+    this.flushCursor();
+  }
+
+  /**
+   * Tells the server where our cursor is, if it hasn't been told. Only possible while we have
+   * no unacknowledged edits: then our text is exactly the server's text at the revision we
+   * have processed, so the position means the same thing to the server. Otherwise this waits
+   * and is called again when the last edit is acknowledged.
+   */
+  private flushCursor(): void {
+    const socket = this.socket;
+    if (!this.cursorDirty || !this.selection || !this.sync || !socket) return;
+    if (!this.joined || socket.readyState !== SOCKET_OPEN || this.sync.state !== "synchronized") return;
+
+    const wait = this.lastCursorSent + this.cursorIntervalMs - Date.now();
+    if (wait > 0) {
+      this.cursorTimer ??= setTimeout(() => {
+        this.cursorTimer = null;
+        this.flushCursor();
+      }, wait);
+      return;
+    }
+    const message: ClientMessage = {
+      type: "cursor",
+      baseRevision: this.sync.processedRevision,
+      ...this.selection,
+    };
+    socket.send(JSON.stringify(message));
+    this.cursorDirty = false;
+    this.lastCursorSent = Date.now();
+  }
+
+  /** The other users' cursors have moved or our pending edits changed: report where to draw them. */
+  private notifyPeers(): void {
+    const sync = this.sync;
+    this.options.listener.onPeersChange?.(
+      [...this.peers].map(([peer, { start, end }]) => ({
+        peer,
+        start: sync ? sync.rebasePosition(start) : start,
+        end: sync ? sync.rebasePosition(end) : end,
+      })),
+    );
+  }
+
+  /** The server's text changed by `op`: move every cursor we track past it, as the server did. */
+  private movePeers(op: Operation): void {
+    for (const [peer, selection] of this.peers) this.peers.set(peer, transformSelection(selection, op));
+  }
+
+  private clearPeers(): void {
+    if (this.peers.size === 0) return;
+    this.peers.clear();
+    this.notifyPeers();
+  }
+
+  private clearCursorTimer(): void {
+    if (this.cursorTimer !== null) clearTimeout(this.cursorTimer);
+    this.cursorTimer = null;
   }
 
   private connect(): void {
@@ -225,29 +332,56 @@ export class DocumentSession {
         // were reconnecting, the server couldn't catch us up, so what we typed offline is lost.
         this.sync = new ClientSync(message.revision);
         this.current = message.text;
+        this.selection = null; // positions in the old text mean nothing in the new one
+        this.cursorDirty = false;
+        this.peers.clear(); // the server sends the current ones right after
         this.markJoined();
         this.options.listener.onRemoteChange(message.text, []);
+        this.notifyPeers();
       } else if (message.type === "catchup") {
         if (!this.sync) throw new Error("Got a catchup without having a document");
         const { toApply, resend } = this.sync.reconnect(message.operations);
         if (this.sync.processedRevision !== message.revision) {
           throw new Error("The catchup doesn't end at the revision the server says");
         }
-        for (const op of toApply) this.current = applyOperation(this.current, op);
+        for (const op of toApply) {
+          this.current = applyOperation(this.current, op);
+          if (this.selection) this.selection = transformSelection(this.selection, op);
+        }
+        this.cursorDirty = this.selection !== null; // the server forgot our cursor with the old connection
+        this.peers.clear(); // the server sends the current ones right after
         this.markJoined();
         if (resend) this.sendEdit(resend);
         this.options.listener.onRemoteChange(this.current, toApply);
+        this.notifyPeers();
+        this.flushCursor();
       } else if (message.type === "pong") {
         // Nothing to do: heardFrom already counted it as proof of life.
       } else if (message.type === "ack") {
         if (!this.sync) throw new Error("Got an ack without having a document");
+        const acknowledged = this.sync.inflightOperation; // as the server applied it
         const next = this.sync.serverAck();
+        if (acknowledged) this.movePeers(acknowledged);
         if (next) this.sendEdit(next);
+        else this.flushCursor(); // synchronized again: now our cursor can be reported
+        this.notifyPeers();
+      } else if (message.type === "peers") {
+        for (const { peer, start, end } of message.peers) this.peers.set(peer, { start, end });
+        this.notifyPeers();
+      } else if (message.type === "cursor") {
+        this.peers.set(message.peer, { start: message.start, end: message.end });
+        this.notifyPeers();
+      } else if (message.type === "peerLeft") {
+        this.peers.delete(message.peer);
+        this.notifyPeers();
       } else {
         if (!this.sync) throw new Error("Got an edit without having a document");
+        this.movePeers(message.op);
         const toApply = this.sync.applyRemote(message.op);
         this.current = applyOperation(this.current, toApply);
+        if (this.selection) this.selection = transformSelection(this.selection, toApply);
         this.options.listener.onRemoteChange(this.current, [toApply]);
+        this.notifyPeers();
       }
     } catch (error) {
       // We and the server disagree about something we can't repair. Throw our copy away and
@@ -260,11 +394,11 @@ export class DocumentSession {
 
   private handleClose(code: number): void {
     if (this.stopped) return;
+    this.clearCursorTimer();
+    this.clearPeers(); // we can't keep them up to date from here
     if (code === CLOSE_POLICY_VIOLATION) {
       // The server refused an edit of ours. Retrying with the same state could repeat it forever.
       this.setStatus("outOfSync");
-    } else if (code === CLOSE_REPLACED) {
-      this.setStatus("replaced");
     } else {
       this.setStatus(this.sync ? "reconnecting" : "connecting");
       this.timer = setTimeout(() => this.connect(), backoffDelay(this.attempt++, this.random));

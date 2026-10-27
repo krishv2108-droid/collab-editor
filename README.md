@@ -4,7 +4,7 @@ A real-time collaborative text editor, built from scratch in TypeScript. The
 conflict-resolution layer is **Operational Transformation (OT)**, implemented by
 hand: no Yjs, Automerge or ShareDB. Documents are stored in **PostgreSQL**.
 
-**Status: Phase 3 complete, plus automatic reconnect.** Any number of browser tabs can
+**Status: Phase 3 complete, plus automatic reconnect and other users' cursors.** Any number of browser tabs can
 edit the same document at once and always converge to identical text, even when edits
 cross paths on a slow network. Documents survive server restarts, and a tab whose
 connection drops keeps working offline and catches up by itself when it is back.
@@ -67,12 +67,43 @@ lose it. So the server and client settle it explicitly:
   buffer used while waiting for an acknowledgement and go out once the tab has caught up.
 - **Half-dead connections.** When a tab rejoins, the server drops any older connection of the
   same tab, so an edit still on its way over the old connection can't be saved a second time.
+  If an old connection's `join` arrives late and the server keeps *it* instead, the tab is
+  told it was replaced and simply reconnects (ids are unique per page load, so only an old
+  connection of the same tab can ever replace it).
 - **Retrying.** Waits grow 0.5 s, 1 s, 2 s... up to 15 s, randomised so that tabs don't all
   return at the same instant after a server restart. The wait resets only once the server
   has answered the join.
 - **Heartbeat.** Browsers hide WebSocket pings from pages, so the client sends its own ping
   after 10 s of quiet and gives up on the connection if nothing comes back within 5 s. The
   server separately drops connections that stay silent for a full round.
+
+### Other users' cursors
+
+A cursor is a number ("character 17"), and that number only means something relative to one
+exact version of the text, so cursors need the same care as edits. They are temporary: never
+saved, never part of the operation log.
+
+- **Reporting.** A tab sends `cursor { baseRevision, start, end }` only while it has no
+  unacknowledged edits, because only then is its text exactly a revision the server has.
+  Anything typed meanwhile is reported once the last edit is acknowledged, and at most once
+  every 50 ms.
+- **The server moves cursors forward.** It transforms the reported position past every edit
+  saved since `baseRevision`, stores it, and moves every stored cursor past each edit it
+  accepts, so a late joiner is told where everyone is. It hands out anonymous names
+  (`Guest 3`); the real `clientId` is never shown.
+- **Clients track cursors in the server's text, not their own.** Each tab moves other
+  users' cursors past every edit the server accepts, including the tab's own edits once they
+  are acknowledged, in the order the server accepted them: exactly what the server does with
+  its copy, so they cannot disagree. What is drawn is that position projected through the
+  tab's own unacknowledged edits. This design is forced, not a preference: moving a position
+  past two concurrent edits in opposite orders can give different answers, because a
+  deletion throws away which side of a concurrent insert the position was on (the smallest
+  case is in `shared/src/position.test.ts`).
+- **Drawing.** A textarea can only show its own caret, so a transparent copy of the text sits
+  behind it, laid out identically, carrying a colored bar and a name tag at each cursor and a
+  tinted background behind each selection.
+- **While disconnected** other users' cursors are hidden, since they can't be kept up to
+  date; they come back with the catch-up.
 
 ## Requirements
 
@@ -127,6 +158,12 @@ acknowledgements for edits the server had already saved), leaves half-dead conne
 edits arrive late, and restarts the server. In the insert-only runs every typed character is
 unique and nothing is deleted, so a lost edit and a duplicated edit both fail the final check.
 
+`client/src/cursorSimulation.test.ts` does the same for cursors, running the real server
+logic (`server/src/hub.ts`) and the real browser logic (`DocumentSession`) over a made-up
+network with delayed and reordered messages, dying and half-dead connections and server
+restarts. At the end every user must see every other user's cursor on exactly the spot where
+that user's own cursor is.
+
 The most important test of the editing logic itself is `server/src/simulation.test.ts`: several simulated clients type
 at random while messages are delivered in random order and clients join mid-session. When
 everything settles, the server and every client must hold the same text. It uses fixed
@@ -142,7 +179,11 @@ seeds, so any failure can be reproduced exactly.
   need a limit on how long a tab can be away.)
 - One server process only. Running several against one database would be detected and
   refused by the revision check, but it isn't supported.
-- Other users' cursors aren't shown.
+- Cursors are anonymous ("Guest 3"; there are no accounts), the direction of a selection isn't
+  shown, and the drawing assumes the textarea and its copy lay text out identically, which
+  holds for plain text in a fixed font but not for, say, a right-to-left language.
+- After a reconnect that falls back to a snapshot, your own cursor is not re-reported until
+  you move it.
 
 ## Roadmap
 
@@ -150,4 +191,5 @@ seeds, so any failure can be reproduced exactly.
 - [x] Phase 2: conflict resolution with OT
 - [x] Phase 3: Postgres persistence with snapshots
 - [x] Reconnect: offline editing, catch-up without duplicates, heartbeat
-- [ ] Next: trimming old operations, showing other users' cursors
+- [x] Other users' cursors: carets, selections, kept correct across edits and reconnects
+- [ ] Next: trimming old operations

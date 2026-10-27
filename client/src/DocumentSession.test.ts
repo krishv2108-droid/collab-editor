@@ -1,5 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { insert, retain, type ClientMessage, type Operation, type ServerMessage } from "@collab/shared";
+import {
+  insert,
+  retain,
+  type ClientMessage,
+  type Operation,
+  type PeerCursor,
+  type ServerMessage,
+} from "@collab/shared";
 import { DocumentSession, type ConnectionStatus, type SocketLike } from "./DocumentSession";
 
 /** A WebSocket we control by hand: the test decides when it opens, what arrives, and when it drops. */
@@ -39,6 +46,7 @@ describe("DocumentSession", () => {
   let sockets: FakeSocket[];
   let statuses: ConnectionStatus[];
   let changes: Array<{ text: string; operations: Operation[] }>;
+  let peerViews: PeerCursor[][];
   let session: DocumentSession;
 
   const latest = () => sockets[sockets.length - 1]!;
@@ -51,6 +59,7 @@ describe("DocumentSession", () => {
     sockets = [];
     statuses = [];
     changes = [];
+    peerViews = [];
     session = new DocumentSession({
       url: "ws://test",
       docId: "doc",
@@ -64,6 +73,7 @@ describe("DocumentSession", () => {
       listener: {
         onStatus: (status) => statuses.push(status),
         onRemoteChange: (text, operations) => changes.push({ text, operations }),
+        onPeersChange: (peers) => peerViews.push(peers),
       },
     });
   });
@@ -303,12 +313,13 @@ describe("DocumentSession", () => {
       expect(socket.closeCalls).toBe(1);
     });
 
-    it("gives up for good when the server says this connection was replaced", () => {
-      joinFresh();
+    it("reconnects when the server says a newer connection replaced this one: it can only have been ours", () => {
+      // An old connection's join reached the server after the new one's, so the server kept the old.
+      joinFresh("abc", 1);
       latest().drop(4001);
-      expect(session.status).toBe("replaced");
-      vi.advanceTimersByTime(60_000);
-      expect(sockets).toHaveLength(1);
+      expect(session.status).toBe("reconnecting");
+      vi.advanceTimersByTime(500);
+      expect(sockets).toHaveLength(2);
     });
 
     it("gives up for good when the server rejects an edit", () => {
@@ -423,6 +434,190 @@ describe("DocumentSession", () => {
       expect(latest().edits).toEqual([]); // not sent twice
       expect(socket.edits).toHaveLength(1);
       expect(session.text).toBe("abcd");
+    });
+  });
+
+  describe("cursors", () => {
+    const cursors = (socket: FakeSocket) =>
+      socket.sent.filter((m): m is Extract<ClientMessage, { type: "cursor" }> => m.type === "cursor");
+    const peersNow = () => peerViews.at(-1);
+
+    describe("sending ours", () => {
+      it("reports the cursor with the revision it was made at", () => {
+        const socket = joinFresh("hello", 4);
+        session.setSelection({ start: 1, end: 3 });
+        expect(cursors(socket)).toEqual([{ type: "cursor", baseRevision: 4, start: 1, end: 3 }]);
+      });
+
+      it("says nothing for a cursor that hasn't moved", () => {
+        const socket = joinFresh("hello", 4);
+        session.setSelection({ start: 1, end: 3 });
+        session.setSelection({ start: 1, end: 3 });
+        expect(cursors(socket)).toHaveLength(1);
+      });
+
+      it("waits while an edit is unacknowledged, then reports where the cursor is by then", () => {
+        const socket = joinFresh("hello", 4);
+        session.edit("hello!"); // in flight
+        session.setSelection({ start: 6, end: 6 });
+        expect(cursors(socket)).toEqual([]); // our text isn't any revision the server has
+
+        socket.receive({ type: "ack" });
+        expect(cursors(socket)).toEqual([{ type: "cursor", baseRevision: 5, start: 6, end: 6 }]);
+      });
+
+      it("waits through a whole chain of edits and reports once, at the end", () => {
+        const socket = joinFresh("", 0);
+        session.edit("a");
+        session.edit("ab"); // buffered
+        session.setSelection({ start: 2, end: 2 });
+        socket.receive({ type: "ack" }); // sends the buffer: still not synchronized
+        expect(cursors(socket)).toEqual([]);
+        socket.receive({ type: "ack" });
+        expect(cursors(socket)).toEqual([{ type: "cursor", baseRevision: 2, start: 2, end: 2 }]);
+      });
+
+      it("doesn't send before the server has answered the join", () => {
+        session.start();
+        latest().open();
+        session.setSelection({ start: 0, end: 0 });
+        expect(cursors(latest())).toEqual([]);
+      });
+
+      it("spaces cursor messages out, sending only the latest position", () => {
+        const socket = joinFresh("hello", 1);
+        session.setSelection({ start: 1, end: 1 });
+        session.setSelection({ start: 2, end: 2 });
+        session.setSelection({ start: 3, end: 3 });
+        expect(cursors(socket)).toHaveLength(1); // the first goes at once
+
+        vi.advanceTimersByTime(49);
+        expect(cursors(socket)).toHaveLength(1);
+        vi.advanceTimersByTime(1);
+        expect(cursors(socket).map((m) => m.start)).toEqual([1, 3]); // 2 was skipped
+      });
+
+      it("reports the cursor again after our own edit, even when it ends up at the same number", () => {
+        const socket = joinFresh("abcd", 1);
+        session.setSelection({ start: 2, end: 2 }); // sent: between b and c
+        session.edit("aXbcd"); // typed before the cursor...
+        session.setSelection({ start: 2, end: 2 }); // ...so the cursor sits after the X: still "2", but not the same place
+        expect(cursors(socket)).toHaveLength(1);
+
+        socket.receive({ type: "ack" });
+        vi.advanceTimersByTime(50); // cursor messages are spaced out
+        // The server moved its copy past the X (to 3), so it has to be told.
+        expect(cursors(socket)).toHaveLength(2);
+        expect(cursors(socket)[1]).toEqual({ type: "cursor", baseRevision: 2, start: 2, end: 2 });
+      });
+
+      it("follows its own cursor through other people's edits instead of reporting it again", () => {
+        const socket = joinFresh("hello", 1);
+        session.setSelection({ start: 2, end: 2 });
+        socket.receive({ type: "edit", op: [insert("XX"), retain(5)] }); // pushes the cursor to 4
+        session.setSelection({ start: 4, end: 4 }); // the textarea reports the moved cursor
+        vi.advanceTimersByTime(1000);
+        expect(cursors(socket)).toHaveLength(1);
+      });
+
+      it("reports it again after reconnecting, because the server forgot it", () => {
+        const socket = joinFresh("hello", 1);
+        session.setSelection({ start: 2, end: 2 });
+        socket.drop();
+        vi.advanceTimersByTime(500);
+        latest().open();
+        latest().receive({ type: "catchup", operations: [{ op: [insert("XX"), retain(5)], own: false }], revision: 2 });
+        expect(cursors(latest())).toEqual([{ type: "cursor", baseRevision: 2, start: 4, end: 4 }]);
+      });
+
+      it("holds it back after reconnecting while an edit still has to be sent again", () => {
+        const socket = joinFresh("hello", 1);
+        session.setSelection({ start: 2, end: 2 });
+        session.edit("hello!");
+        socket.drop();
+        vi.advanceTimersByTime(500);
+        latest().open();
+        latest().receive({ type: "catchup", operations: [], revision: 1 });
+        expect(cursors(latest())).toEqual([]);
+        latest().receive({ type: "ack" });
+        expect(cursors(latest())).toHaveLength(1);
+      });
+    });
+
+    describe("showing theirs", () => {
+      it("reports a peer's cursor as it arrives", () => {
+        const socket = joinFresh("hello", 1);
+        socket.receive({ type: "cursor", peer: "7", start: 1, end: 3 });
+        expect(peersNow()).toEqual([{ peer: "7", start: 1, end: 3 }]);
+      });
+
+      it("learns the cursors already there when joining", () => {
+        session.start();
+        latest().open();
+        latest().receive({ type: "snapshot", text: "hello", revision: 1 });
+        latest().receive({ type: "peers", peers: [{ peer: "1", start: 0, end: 0 }, { peer: "2", start: 4, end: 5 }] });
+        expect(peersNow()).toEqual([
+          { peer: "1", start: 0, end: 0 },
+          { peer: "2", start: 4, end: 5 },
+        ]);
+      });
+
+      it("forgets a peer who left", () => {
+        const socket = joinFresh("hello", 1);
+        socket.receive({ type: "cursor", peer: "7", start: 1, end: 1 });
+        socket.receive({ type: "peerLeft", peer: "7" });
+        expect(peersNow()).toEqual([]);
+      });
+
+      it("moves a cursor along with other people's edits", () => {
+        const socket = joinFresh("hello", 1);
+        socket.receive({ type: "cursor", peer: "7", start: 2, end: 4 });
+        socket.receive({ type: "edit", op: [insert("XX"), retain(5)] });
+        expect(peersNow()).toEqual([{ peer: "7", start: 4, end: 6 }]);
+      });
+
+      it("moves a cursor along with our own edits once the server has accepted them", () => {
+        const socket = joinFresh("hello", 1);
+        socket.receive({ type: "cursor", peer: "7", start: 2, end: 2 });
+        session.edit("XXhello"); // on screen at once, though the server doesn't have it yet
+        expect(peersNow()).toEqual([{ peer: "7", start: 4, end: 4 }]);
+        socket.receive({ type: "ack" }); // now it does; the cursor must not move twice
+        expect(peersNow()).toEqual([{ peer: "7", start: 4, end: 4 }]);
+        socket.receive({ type: "edit", op: [retain(7), insert("!")] });
+        expect(peersNow()).toEqual([{ peer: "7", start: 4, end: 4 }]);
+      });
+
+      it("draws a cursor past edits that are still buffered", () => {
+        const socket = joinFresh("hello", 1);
+        socket.receive({ type: "cursor", peer: "7", start: 5, end: 5 });
+        session.edit("Xhello"); // in flight
+        session.edit("XYhello"); // buffered
+        expect(peersNow()).toEqual([{ peer: "7", start: 7, end: 7 }]);
+      });
+
+      it("hides everyone's cursor while disconnected, and takes the server's word again on return", () => {
+        const socket = joinFresh("hello", 1);
+        socket.receive({ type: "cursor", peer: "7", start: 2, end: 2 });
+        socket.drop();
+        expect(peersNow()).toEqual([]);
+
+        vi.advanceTimersByTime(500);
+        latest().open();
+        latest().receive({ type: "catchup", operations: [], revision: 1 });
+        expect(peersNow()).toEqual([]);
+        latest().receive({ type: "peers", peers: [{ peer: "9", start: 3, end: 3 }] });
+        expect(peersNow()).toEqual([{ peer: "9", start: 3, end: 3 }]);
+      });
+
+      it("drops the old cursors when a snapshot replaces the whole text", () => {
+        const socket = joinFresh("hello", 1);
+        socket.receive({ type: "cursor", peer: "7", start: 2, end: 2 });
+        socket.drop();
+        vi.advanceTimersByTime(500);
+        latest().open();
+        latest().receive({ type: "snapshot", text: "other", revision: 9 });
+        expect(peersNow()).toEqual([]);
+      });
     });
   });
 

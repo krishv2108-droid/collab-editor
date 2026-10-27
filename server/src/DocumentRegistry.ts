@@ -1,4 +1,10 @@
-import type { MissedOperation, Operation } from "@collab/shared";
+import {
+  transformSelection,
+  type MissedOperation,
+  type Operation,
+  type PeerCursor,
+  type Selection,
+} from "@collab/shared";
 import type { DocumentStore } from "./DocumentStore";
 import { ServerDocument } from "./ServerDocument";
 
@@ -36,6 +42,8 @@ export interface RegistryOptions<C> {
    * clientId) joined again from a new one. The registry has already forgotten it.
    */
   onClientReplaced?(client: C): void;
+  /** Called with the clients that should be told a user with a cursor is gone. */
+  onPeerLeft?(recipients: C[], peer: string): void;
 }
 
 export interface JoinOptions {
@@ -55,6 +63,16 @@ export interface JoinResult {
    * the whole snapshot instead".
    */
   missed?: MissedOperation[];
+  /** Everyone else's cursor, in the text as it is now. Absent if nobody else has one. */
+  peers?: PeerCursor[];
+}
+
+/** What the room knows about one connected user besides their edits. */
+interface Peer {
+  /** An anonymous name for this connection, safe to show to others (unlike the clientId). */
+  id: string;
+  /** In the text as it is now: moved past every edit as it is accepted. Null until they send one. */
+  selection: Selection | null;
 }
 
 interface Membership<C> {
@@ -71,6 +89,7 @@ interface Room<C> {
   docId: string;
   document: Promise<ServerDocument>;
   clients: Set<C>;
+  peers: Map<C, Peer>;
   tail: Promise<unknown>;
   /** True once the room has been removed from memory; nothing more may happen in it. */
   evicted: boolean;
@@ -93,6 +112,7 @@ export class DocumentRegistry<C> {
   private readonly memberships = new Map<C, Membership<C>>();
   private readonly pendingSnapshots = new Set<Promise<void>>();
   private readonly snapshotEvery: number;
+  private peerCounter = 0;
 
   constructor(
     private readonly store: DocumentStore,
@@ -135,9 +155,14 @@ export class DocumentRegistry<C> {
               : undefined;
           if (this.memberships.get(client) !== membership) return null; // left while we looked
 
+          const others = [...room.peers.values()].flatMap((peer) =>
+            peer.selection ? [{ peer: peer.id, ...peer.selection }] : [],
+          );
           room.clients.add(client);
+          room.peers.set(client, { id: String(++this.peerCounter), selection: null });
           const joined: JoinResult = { text: document.text, revision: document.revision };
           if (missed) joined.missed = missed;
+          if (others.length > 0) joined.peers = others;
           return joined;
         });
         if (result !== "retry") return result;
@@ -160,6 +185,7 @@ export class DocumentRegistry<C> {
 
     const { room } = membership;
     room.clients.delete(client);
+    this.removePeer(room, client);
     if (room.clients.size === 0) {
       // Queue the eviction behind any edit still being saved, and skip it if
       // someone joined in the meantime.
@@ -193,10 +219,44 @@ export class DocumentRegistry<C> {
         throw this.failRoom(room, cause);
       }
       document.commit(edit); // saved, so now it is real
+      // Everyone's cursor moves past the edit, in the same order the clients move theirs.
+      for (const peer of room.peers.values()) {
+        if (peer.selection) peer.selection = transformSelection(peer.selection, edit.op);
+      }
       room.lastSnapshotRevision ??= document.startRevision;
       this.maybeSaveSnapshot(room, edit.revision, edit.nextText);
 
       return { op: edit.op, recipients: [...room.clients].filter((c) => c !== client) };
+    });
+  }
+
+  /**
+   * Records where `client`'s cursor is, given in the text of revision `baseRevision` (the
+   * revision the client had processed, with no edits of its own pending). Resolves with what
+   * to tell the others, or null if the cursor couldn't be used: a cursor is never worth
+   * disconnecting anyone over, it is simply ignored. Rejects if the client hasn't joined.
+   */
+  applyCursor(
+    client: C,
+    baseRevision: number,
+    selection: Selection,
+  ): Promise<{ peer: string; selection: Selection; recipients: C[] } | null> {
+    const membership = this.memberships.get(client);
+    if (!membership) return Promise.reject(new Error("Client has not joined a document"));
+    const { room } = membership;
+
+    return this.enqueue(room, async () => {
+      const peer = room.peers.get(client);
+      if (room.evicted || !peer) return null;
+      const document = await room.document;
+      let moved: Selection;
+      try {
+        moved = document.selectionFrom(baseRevision, selection);
+      } catch {
+        return null; // a revision we no longer keep
+      }
+      peer.selection = moved;
+      return { peer: peer.id, selection: moved, recipients: [...room.clients].filter((c) => c !== client) };
     });
   }
 
@@ -222,6 +282,7 @@ export class DocumentRegistry<C> {
         docId,
         document: this.loadDocument(docId),
         clients: new Set(),
+        peers: new Map(),
         tail: Promise.resolve(),
         evicted: false,
         lastSnapshotRevision: null,
@@ -260,12 +321,20 @@ export class DocumentRegistry<C> {
     this.pendingSnapshots.add(saving);
   }
 
+  /** Forgets a user's cursor and, if the others had been shown it, tells them it is gone. */
+  private removePeer(room: Room<C>, client: C): void {
+    const peer = room.peers.get(client);
+    room.peers.delete(client);
+    if (peer?.selection && !room.evicted) this.options.onPeerLeft?.([...room.clients], peer.id);
+  }
+
   /** Forgets every other connection of the same tab in this room and tells the owner of the registry. */
   private replaceOlderConnections(room: Room<C>, client: C, clientId: string): void {
     for (const [other, membership] of this.memberships) {
       if (other === client || membership.room !== room || membership.clientId !== clientId) continue;
       this.memberships.delete(other);
       room.clients.delete(other);
+      this.removePeer(room, other);
       this.options.onClientReplaced?.(other);
     }
   }
@@ -317,6 +386,7 @@ export class DocumentRegistry<C> {
     const clients = [...room.clients];
     this.evict(room);
     room.clients.clear();
+    room.peers.clear();
     for (const client of clients) {
       if (this.memberships.get(client)?.room === room) this.memberships.delete(client);
     }

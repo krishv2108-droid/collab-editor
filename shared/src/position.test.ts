@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { del, insert, retain, targetLength } from "./operation";
-import { transformPosition } from "./position";
+import { applyOperation as applyOperationText, del, insert, retain, targetLength } from "./operation";
+import { transformPosition, transformSelection } from "./position";
+import { transform } from "./transform";
 import { createRng, randomOperation, randomText } from "./testing";
 
 describe("transformPosition", () => {
@@ -46,6 +47,46 @@ describe("transformPosition", () => {
         expect(moved).toBeLessThanOrEqual(targetLength(op));
         previous = moved;
       }
+    }
+  });
+});
+
+describe("transformSelection", () => {
+  it("moves both ends", () => {
+    const op = [retain(2), insert("abc"), retain(3)];
+    expect(transformSelection({ start: 1, end: 4 }, op)).toEqual({ start: 1, end: 7 });
+  });
+});
+
+describe("positions and concurrent edits", () => {
+  // Text is order-independent: apply two concurrent edits in either order (after transform())
+  // and you get the same text. Positions are not. This is the smallest case: a cursor at the
+  // end of "c", while one user inserts "y" before it and another deletes the "c".
+  it("is not order-independent, which is why cursors must be moved in a fixed order", () => {
+    const insertY = [insert("y"), retain(1)];
+    const deleteC = [del(1)];
+    const [insertYAfterDelete, deleteCAfterInsert] = transform(insertY, deleteC);
+
+    const insertFirst = transformPosition(transformPosition(1, insertY), deleteCAfterInsert);
+    const deleteFirst = transformPosition(transformPosition(1, deleteC), insertYAfterDelete);
+    expect(insertFirst).toBe(1); // "y|"
+    expect(deleteFirst).toBe(0); // "|y"
+  });
+
+  it("does agree when every party applies the same edits in the same order", () => {
+    const rng = createRng(11);
+    for (let i = 0; i < 1000; i++) {
+      let doc = randomText(rng, 10);
+      const position = Math.floor(rng() * (doc.length + 1));
+      const ops = [];
+      for (let k = 0; k < 4; k++) {
+        const op = randomOperation(rng, doc);
+        doc = applyOperationText(doc, op);
+        ops.push(op);
+      }
+      const once = ops.reduce((p, op) => transformPosition(p, op), position);
+      const again = ops.reduce((p, op) => transformPosition(p, op), position);
+      expect(again).toBe(once);
     }
   });
 });

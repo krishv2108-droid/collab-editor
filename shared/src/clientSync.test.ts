@@ -94,6 +94,45 @@ describe("ClientSync: remote operations", () => {
   });
 });
 
+describe("ClientSync: other users' cursors", () => {
+  it("leaves a position alone when nothing is pending", () => {
+    expect(new ClientSync(0).rebasePosition(3)).toBe(3);
+  });
+
+  it("moves a position past the in-flight edit", () => {
+    const sync = new ClientSync(0);
+    sync.applyLocal([insert("XX"), retain(5)]);
+    expect(sync.rebasePosition(0)).toBe(0); // a cursor exactly at an insert stays before it
+    expect(sync.rebasePosition(3)).toBe(5);
+  });
+
+  it("moves it past the buffer too, in order", () => {
+    const sync = new ClientSync(0);
+    sync.applyLocal([insert("XX"), retain(5)]); // in flight
+    sync.applyLocal([retain(7), insert("!")]); // buffer, made against the text after the in-flight edit
+    expect(sync.rebasePosition(4)).toBe(6); // past the in-flight insert only
+    expect(sync.rebasePosition(5)).toBe(7); // the end of the text: stays before the buffer's "!"
+  });
+
+  it("collapses a position whose text we deleted", () => {
+    const sync = new ClientSync(0);
+    sync.applyLocal([retain(1), del(3), retain(2)]);
+    expect(sync.rebasePosition(2)).toBe(1);
+  });
+});
+
+describe("ClientSync: inflightOperation", () => {
+  it("is the op as rewritten to fit the server's text, so it is what the server will apply", () => {
+    const sync = new ClientSync(1);
+    expect(sync.inflightOperation).toBeNull();
+    sync.applyLocal([retain(3), insert("Y")]);
+    sync.applyRemote([insert("XX"), retain(3)]);
+    expect(sync.inflightOperation).toEqual([retain(5), insert("Y")]);
+    sync.serverAck();
+    expect(sync.inflightOperation).toBeNull();
+  });
+});
+
 describe("ClientSync: reconnecting", () => {
   it("has nothing to do when synchronized and nothing was missed", () => {
     const sync = new ClientSync(3);

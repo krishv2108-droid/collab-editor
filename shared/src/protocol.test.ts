@@ -45,6 +45,24 @@ describe("parseClientMessage", () => {
     expect(parseClientMessage('{"type":"ping"}')).toEqual({ type: "ping" });
   });
 
+  it("accepts a cursor", () => {
+    const message = { type: "cursor", baseRevision: 4, start: 2, end: 5 };
+    expect(parseClientMessage(JSON.stringify(message))).toEqual(message);
+    expect(parseClientMessage('{"type":"cursor","baseRevision":0,"start":0,"end":0}')).not.toBeNull();
+  });
+
+  it("rejects a cursor with a bad revision or positions", () => {
+    const cursor = (extra: object) =>
+      JSON.stringify({ type: "cursor", baseRevision: 1, start: 1, end: 2, ...extra });
+    expect(parseClientMessage(cursor({ baseRevision: -1 }))).toBeNull();
+    expect(parseClientMessage(cursor({ baseRevision: 1.5 }))).toBeNull();
+    expect(parseClientMessage(cursor({ start: -1 }))).toBeNull();
+    expect(parseClientMessage(cursor({ end: "2" }))).toBeNull();
+    expect(parseClientMessage(cursor({ end: 0.5 }))).toBeNull();
+    expect(parseClientMessage(cursor({ start: 3, end: 2 }))).toBeNull(); // start must not pass end
+    expect(parseClientMessage('{"type":"cursor","baseRevision":1,"start":1}')).toBeNull();
+  });
+
   it("rejects garbage", () => {
     expect(parseClientMessage("not json")).toBeNull();
     expect(parseClientMessage("42")).toBeNull();
@@ -119,6 +137,27 @@ describe("parseServerMessage", () => {
     expect(parseServerMessage(catchup([{ op: "bad", own: true }]))).toBeNull();
     expect(parseServerMessage(catchup([], -1))).toBeNull();
     expect(parseServerMessage(catchup([], 1.5))).toBeNull();
+  });
+
+  it("accepts peers, a peer's cursor, and a peer leaving", () => {
+    const peers = { type: "peers", peers: [{ peer: "1", start: 0, end: 3 }, { peer: "2", start: 5, end: 5 }] };
+    expect(parseServerMessage(JSON.stringify(peers))).toEqual(peers);
+    expect(parseServerMessage('{"type":"peers","peers":[]}')).toEqual({ type: "peers", peers: [] });
+    const cursor = { type: "cursor", peer: "7", start: 1, end: 1 };
+    expect(parseServerMessage(JSON.stringify(cursor))).toEqual(cursor);
+    expect(parseServerMessage('{"type":"peerLeft","peer":"7"}')).toEqual({ type: "peerLeft", peer: "7" });
+  });
+
+  it("rejects malformed peer messages", () => {
+    const peers = (list: unknown) => JSON.stringify({ type: "peers", peers: list });
+    expect(parseServerMessage(peers("nope"))).toBeNull();
+    expect(parseServerMessage(peers([null]))).toBeNull();
+    expect(parseServerMessage(peers([{ peer: "", start: 0, end: 0 }]))).toBeNull();
+    expect(parseServerMessage(peers([{ peer: "x".repeat(33), start: 0, end: 0 }]))).toBeNull();
+    expect(parseServerMessage(peers([{ peer: "1", start: 2, end: 1 }]))).toBeNull();
+    expect(parseServerMessage('{"type":"cursor","start":0,"end":0}')).toBeNull(); // no peer
+    expect(parseServerMessage('{"type":"cursor","peer":"1","start":-1,"end":0}')).toBeNull();
+    expect(parseServerMessage('{"type":"peerLeft"}')).toBeNull();
   });
 
   it("accepts a pong", () => {

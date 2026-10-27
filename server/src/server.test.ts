@@ -269,7 +269,7 @@ describe("collab server", () => {
       expect(await carol.next()).toEqual({ type: "snapshot", text: "hello", revision: 1 });
     });
 
-    it("closes the older connection of a tab that connects again, with a code that means 'don't retry'", async () => {
+    it("closes the older connection of a tab that connects again, with its own close code", async () => {
       const first = await connect();
       first.send({ type: "join", docId: "doc1", clientId: "tab" });
       await first.next();
@@ -389,6 +389,87 @@ describe("collab server", () => {
       }
       expect(open).toBe(true);
       chatty.terminate();
+    });
+  });
+  describe("cursors", () => {
+    it("relays a cursor to the others only, tagged with an anonymous name", async () => {
+      const alice = await join("doc1");
+      const bob = await join("doc1");
+      alice.send({ type: "edit", baseRevision: 0, op: [insert("hello")] });
+      await alice.next(); // ack
+      await bob.next(); // the edit
+
+      alice.send({ type: "cursor", baseRevision: 1, start: 1, end: 3 });
+      expect(await bob.next()).toEqual({ type: "cursor", peer: expect.any(String), start: 1, end: 3 });
+      await sleep(50);
+      expect(alice.pendingCount).toBe(0);
+    });
+
+    it("sends a late joiner everyone's cursors right after the snapshot", async () => {
+      const alice = await join("doc1");
+      alice.send({ type: "edit", baseRevision: 0, op: [insert("hello")] });
+      await alice.next();
+      alice.send({ type: "cursor", baseRevision: 1, start: 2, end: 2 });
+      await sleep(50);
+
+      const bob = await connect();
+      bob.send({ type: "join", docId: "doc1" });
+      expect(await bob.next()).toEqual({ type: "snapshot", text: "hello", revision: 1 });
+      expect(await bob.next()).toEqual({
+        type: "peers",
+        peers: [{ peer: expect.any(String), start: 2, end: 2 }],
+      });
+    });
+
+    it("tells the others when a user with a cursor disconnects", async () => {
+      const alice = await join("doc1");
+      const bob = await join("doc1");
+      alice.send({ type: "edit", baseRevision: 0, op: [insert("hello")] });
+      await alice.next();
+      await bob.next();
+      alice.send({ type: "cursor", baseRevision: 1, start: 0, end: 0 });
+      const cursor = await bob.next();
+      if (cursor.type !== "cursor") throw new Error("expected a cursor");
+
+      alice.close();
+      expect(await bob.next()).toEqual({ type: "peerLeft", peer: cursor.peer });
+    });
+
+    it("doesn't disconnect anyone over a cursor it can't use", async () => {
+      const alice = await join("doc1");
+      alice.send({ type: "cursor", baseRevision: 99, start: 0, end: 0 });
+      alice.send({ type: "ping" });
+      expect(await alice.next()).toEqual({ type: "pong" });
+    });
+
+    it("ignores a cursor from someone who hasn't joined", async () => {
+      const alice = await connect();
+      alice.send({ type: "cursor", baseRevision: 0, start: 0, end: 0 });
+      alice.send({ type: "ping" });
+      expect(await alice.next()).toEqual({ type: "pong" });
+    });
+
+    it("keeps a cursor in the right place when an edit lands before it", async () => {
+      const alice = await join("doc1");
+      const bob = await join("doc1");
+      const carol = await join("doc1");
+      alice.send({ type: "edit", baseRevision: 0, op: [insert("abc")] });
+      for (const c of [alice, bob, carol]) await c.next();
+
+      bob.send({ type: "cursor", baseRevision: 1, start: 2, end: 2 });
+      await alice.next(); // bob's cursor
+      await carol.next();
+
+      alice.send({ type: "edit", baseRevision: 1, op: [insert("XX"), retain(3)] });
+      await alice.next();
+      await bob.next();
+      await carol.next();
+
+      // A user who joins now is told where bob's cursor is in "XXabc".
+      const dave = await connect();
+      dave.send({ type: "join", docId: "doc1" });
+      await dave.next();
+      expect(await dave.next()).toEqual({ type: "peers", peers: [{ peer: expect.any(String), start: 4, end: 4 }] });
     });
   });
 });

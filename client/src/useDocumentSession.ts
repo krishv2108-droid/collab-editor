@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { Selection } from "@collab/shared";
 import { DocumentSession, type ConnectionStatus, type SessionListener } from "./DocumentSession";
 
 const SERVER_URL =
@@ -11,13 +12,16 @@ function newClientId(): string {
 
 /**
  * Connects this component to a document for as long as it is mounted. All the real work
- * (OT, reconnecting) is in DocumentSession; this only ties it to React.
+ * (OT, reconnecting, cursors) is in DocumentSession; this only ties it to React.
  */
-export function useDocumentSession(docId: string, listener: Pick<SessionListener, "onRemoteChange">) {
+export function useDocumentSession(
+  docId: string,
+  listener: Pick<SessionListener, "onRemoteChange" | "onPeersChange">,
+) {
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const sessionRef = useRef<DocumentSession | null>(null);
 
-  // Always call the newest callback without reconnecting when it changes.
+  // Always call the newest callbacks without reconnecting when they change.
   const listenerRef = useRef(listener);
   listenerRef.current = listener;
 
@@ -30,6 +34,7 @@ export function useDocumentSession(docId: string, listener: Pick<SessionListener
       listener: {
         onStatus: setStatus,
         onRemoteChange: (text, operations) => listenerRef.current.onRemoteChange(text, operations),
+        onPeersChange: (peers) => listenerRef.current.onPeersChange?.(peers),
       },
     });
     sessionRef.current = session;
@@ -48,6 +53,8 @@ export function useDocumentSession(docId: string, listener: Pick<SessionListener
 
   /** The user changed the text to `text`. */
   const edit = useCallback((text: string) => sessionRef.current?.edit(text), []);
+  /** The user moved their cursor or changed what is highlighted. */
+  const setSelection = useCallback((selection: Selection) => sessionRef.current?.setSelection(selection), []);
 
-  return { status, edit };
+  return { status, edit, setSelection };
 }

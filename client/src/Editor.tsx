@@ -1,6 +1,7 @@
-import { useLayoutEffect, useRef, useState, type ChangeEvent } from "react";
-import { transformPosition } from "@collab/shared";
+import { useLayoutEffect, useRef, useState, type ChangeEvent, type CSSProperties, type SyntheticEvent } from "react";
+import { transformPosition, type PeerCursor } from "@collab/shared";
 import type { ConnectionStatus } from "./DocumentSession";
+import { PeerCursors } from "./PeerCursors";
 import { useDocumentSession } from "./useDocumentSession";
 
 interface Selection {
@@ -13,17 +14,33 @@ const STATUS_MESSAGES: Record<ConnectionStatus, string | null> = {
   connecting: "Connecting…",
   ready: null,
   reconnecting: "Connection lost. Reconnecting… keep typing, your changes are kept and will sync.",
-  replaced: "This document was opened again from this tab, so this connection was closed. Reload the page.",
   outOfSync: "This page got out of sync with the server. Reload the page.",
+};
+
+// The textarea and the copy of its text that carries other users' cursors must look identical.
+const FIELD_STYLE: CSSProperties = {
+  boxSizing: "border-box",
+  width: "100%",
+  margin: 0,
+  padding: "0.75rem",
+  border: "1px solid #bbb",
+  borderRadius: 4,
+  font: "16px/1.5 ui-monospace, Menlo, Consolas, monospace",
+  whiteSpace: "pre-wrap",
+  overflowWrap: "break-word",
+  overflowY: "scroll",
 };
 
 export function Editor({ docId }: { docId: string }) {
   const [text, setText] = useState("");
+  const [peers, setPeers] = useState<PeerCursor[]>([]);
+  const [scrollTop, setScrollTop] = useState(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // Where the cursor should go after the next render (set by remote edits).
   const pendingSelection = useRef<Selection | null>(null);
 
-  const { status, edit } = useDocumentSession(docId, {
+  const { status, edit, setSelection } = useDocumentSession(docId, {
+    onPeersChange: setPeers,
     onRemoteChange(newText, operations) {
       // The server's changes don't know where the user's cursor is; move it along with them.
       const textarea = textareaRef.current;
@@ -51,8 +68,17 @@ export function Editor({ docId }: { docId: string }) {
   }, [text]);
 
   function handleChange(event: ChangeEvent<HTMLTextAreaElement>) {
-    setText(event.target.value);
-    edit(event.target.value);
+    const { value, selectionStart, selectionEnd } = event.target;
+    setText(value);
+    edit(value);
+    setSelection({ start: selectionStart, end: selectionEnd });
+  }
+
+  // Fires when the user moves the cursor or changes the highlight. (Moves we make ourselves,
+  // to follow other people's edits, land on what the session already expects and are ignored.)
+  function handleSelect(event: SyntheticEvent<HTMLTextAreaElement>) {
+    const { selectionStart, selectionEnd } = event.currentTarget;
+    setSelection({ start: selectionStart, end: selectionEnd });
   }
 
   // Typing is fine whenever we hold a document, including while the connection is down.
@@ -77,15 +103,20 @@ export function Editor({ docId }: { docId: string }) {
           {message}
         </p>
       )}
-      <textarea
-        ref={textareaRef}
-        value={text}
-        onChange={handleChange}
-        disabled={!editable}
-        rows={16}
-        style={{ width: "100%", fontSize: "1rem", padding: "0.75rem", boxSizing: "border-box" }}
-        placeholder={editable ? "Start typing…" : "Connecting…"}
-      />
+      <div style={{ position: "relative", background: "white" }}>
+        <PeerCursors text={text} peers={peers} scrollTop={scrollTop} fieldStyle={FIELD_STYLE} />
+        <textarea
+          ref={textareaRef}
+          value={text}
+          onChange={handleChange}
+          onSelect={handleSelect}
+          onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+          disabled={!editable}
+          rows={16}
+          style={{ ...FIELD_STYLE, display: "block", position: "relative", background: "transparent", resize: "none" }}
+          placeholder={editable ? "Start typing…" : "Connecting…"}
+        />
+      </div>
     </div>
   );
 }
