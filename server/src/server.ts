@@ -16,6 +16,9 @@ const CLOSE_INTERNAL_ERROR = 1011;
 // this older connection was dropped. A client that sees it must not reconnect.
 const CLOSE_REPLACED = 4001;
 
+/** How often to check that every connection is still alive. */
+export const DEFAULT_HEARTBEAT_MS = 30_000;
+
 function send(socket: WebSocket, message: ServerMessage): void {
   if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
 }
@@ -32,7 +35,7 @@ export interface CollabServer {
 export function createCollabServer(
   port: number,
   store: DocumentStore,
-  options: { snapshotEvery?: number } = {},
+  options: { snapshotEvery?: number; heartbeatMs?: number } = {},
 ): Promise<CollabServer> {
   const wss = new WebSocketServer({ port, maxPayload: MAX_MESSAGE_BYTES });
   const registry = new DocumentRegistry<WebSocket>(store, {
@@ -48,7 +51,10 @@ export function createCollabServer(
     },
   });
 
-  async function handleMessage(socket: WebSocket, message: ClientMessage): Promise<void> {
+  async function handleMessage(
+    socket: WebSocket,
+    message: Exclude<ClientMessage, { type: "ping" }>,
+  ): Promise<void> {
     if (message.type === "join") {
       try {
         const joined = await registry.join(message.docId, socket, {
@@ -83,7 +89,26 @@ export function createCollabServer(
     }
   }
 
+  // Connections that went silent (laptop closed, Wi-Fi gone) never tell us they are gone;
+  // TCP can take many minutes to notice. So every `heartbeatMs` we ask each connection to
+  // answer, and drop the ones that haven't said anything since the previous round. Dropping
+  // is what frees the document's memory and ends that tab's place in the room.
+  const heardSinceLastRound = new WeakSet<WebSocket>();
+  const heartbeat = setInterval(() => {
+    for (const socket of wss.clients) {
+      if (!heardSinceLastRound.has(socket)) {
+        socket.terminate();
+        continue;
+      }
+      heardSinceLastRound.delete(socket);
+      socket.ping(); // browsers answer automatically
+    }
+  }, options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS);
+
   wss.on("connection", (socket) => {
+    heardSinceLastRound.add(socket);
+    socket.on("pong", () => heardSinceLastRound.add(socket));
+
     // Handling a message now takes time (loading, saving), so messages from one client are
     // processed one after another. Edits must be applied in the order the client made them.
     let pending: Promise<void> = Promise.resolve();
@@ -92,6 +117,13 @@ export function createCollabServer(
       if (isBinary) return;
       const message = parseClientMessage(data.toString());
       if (!message) return;
+      heardSinceLastRound.add(socket); // any message proves the connection is alive
+      if (message.type === "ping") {
+        // Answered at once, not queued behind a slow save: a pong only has to prove
+        // that the connection works.
+        send(socket, { type: "pong" });
+        return;
+      }
       pending = pending
         .then(() => handleMessage(socket, message))
         .catch((error) => console.error("Unexpected error handling a message:", error));
@@ -101,7 +133,10 @@ export function createCollabServer(
   });
 
   return new Promise((resolve, reject) => {
-    wss.once("error", reject);
+    wss.once("error", (error) => {
+      clearInterval(heartbeat); // we never started, so nothing will call close()
+      reject(error);
+    });
     wss.once("listening", () => {
       const address = wss.address();
       if (typeof address === "string" || address === null) {
@@ -111,6 +146,7 @@ export function createCollabServer(
       resolve({
         port: address.port,
         close: async () => {
+          clearInterval(heartbeat);
           for (const client of wss.clients) client.terminate();
           await new Promise<void>((done) => wss.close(() => done()));
           await registry.flushSnapshots(); // let any snapshot being saved finish before the store closes

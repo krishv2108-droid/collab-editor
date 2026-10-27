@@ -6,6 +6,7 @@ import {
   insert,
   retain,
 } from "@collab/shared";
+import { WebSocket } from "ws";
 import { FlakyStore } from "./FlakyStore";
 import { InMemoryStore } from "./InMemoryStore";
 import { createCollabServer, type CollabServer } from "./server";
@@ -33,8 +34,11 @@ describe("collab server", () => {
   const extraServers: CollabServer[] = [];
 
   /** An additional server, for tests that need their own store or a restart. */
-  async function startServer(store: InMemoryStore | FlakyStore): Promise<CollabServer> {
-    const extra = await createCollabServer(0, store);
+  async function startServer(
+    store: InMemoryStore | FlakyStore,
+    options: { heartbeatMs?: number } = {},
+  ): Promise<CollabServer> {
+    const extra = await createCollabServer(0, store, options);
     extraServers.push(extra);
     return extra;
   }
@@ -321,6 +325,70 @@ describe("collab server", () => {
         check.send({ type: "join", docId });
         expect(await check.next()).toMatchObject({ type: "snapshot", text: alice.text });
       }
+    });
+  });
+  describe("heartbeat", () => {
+    it("answers a ping with a pong", async () => {
+      const alice = await connect();
+      alice.send({ type: "ping" });
+      expect(await alice.next()).toEqual({ type: "pong" });
+    });
+
+    it("answers a ping at once, even while a save is slow", async () => {
+      const store = new FlakyStore();
+      const slow = await startServer(store);
+      const alice = await TestClient.connect(slow.port);
+      clients.push(alice);
+      alice.send({ type: "join", docId: "doc1" });
+      await alice.next();
+
+      store.delayMs = 300;
+      alice.send({ type: "edit", baseRevision: 0, op: [insert("hello")] });
+      alice.send({ type: "ping" });
+      expect(await alice.next()).toEqual({ type: "pong" }); // before the ack
+      expect(await alice.next()).toEqual({ type: "ack" });
+    });
+
+    /** A raw socket that never answers the server's pings, like a connection whose other end vanished. */
+    function connectSilent(port: number): Promise<WebSocket> {
+      return new Promise((resolve, reject) => {
+        const socket = new WebSocket(`ws://localhost:${port}`, { autoPong: false });
+        socket.once("open", () => resolve(socket));
+        socket.once("error", reject);
+      });
+    }
+    const closedWithin = (socket: WebSocket, ms: number) =>
+      Promise.race([
+        new Promise<boolean>((resolve) => socket.once("close", () => resolve(true))),
+        sleep(ms).then(() => false),
+      ]);
+
+    it("drops a connection that goes silent", async () => {
+      const quick = await startServer(new InMemoryStore(), { heartbeatMs: 50 });
+      const silent = await connectSilent(quick.port);
+      expect(await closedWithin(silent, 1000)).toBe(true);
+    });
+
+    it("keeps a connection that answers, however many rounds pass", async () => {
+      const quick = await startServer(new InMemoryStore(), { heartbeatMs: 50 });
+      const alice = await TestClient.connect(quick.port);
+      clients.push(alice);
+      await sleep(400); // eight rounds; the library answers the pings by itself
+      alice.send({ type: "join", docId: "doc1" });
+      expect(await alice.next()).toEqual({ type: "snapshot", text: "", revision: 0 });
+    });
+
+    it("keeps a connection that only talks in messages, like a browser's own ping", async () => {
+      const quick = await startServer(new InMemoryStore(), { heartbeatMs: 50 });
+      const chatty = await connectSilent(quick.port); // never answers WebSocket pings
+      let open = true;
+      chatty.once("close", () => (open = false));
+      for (let i = 0; i < 12; i++) {
+        chatty.send(JSON.stringify({ type: "ping" }));
+        await sleep(25);
+      }
+      expect(open).toBe(true);
+      chatty.terminate();
     });
   });
 });

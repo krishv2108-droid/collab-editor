@@ -182,7 +182,7 @@ describe("DocumentSession", () => {
       latest().drop();
       session.retryNow();
       expect(sockets).toHaveLength(2);
-      vi.advanceTimersByTime(60_000); // and the old timer doesn't make a third attempt
+      vi.advanceTimersByTime(4_000); // and the old timer doesn't make a third attempt
       expect(sockets).toHaveLength(2);
     });
 
@@ -291,7 +291,7 @@ describe("DocumentSession", () => {
       latest().receive({ type: "catchup", operations: [], revision: 7 }); // we were at 1, nothing missed
       expect(latest().closeCalls).toBe(1);
 
-      vi.advanceTimersByTime(60_000);
+      vi.advanceTimersByTime(1_000);
       expect(sockets).toHaveLength(3);
       latest().open();
       expect(latest().sent).toEqual([{ type: "join", docId: "doc", clientId: "tab-1" }]); // no revision: asks for a snapshot
@@ -324,6 +324,105 @@ describe("DocumentSession", () => {
       latest().drop(1011);
       vi.advanceTimersByTime(500);
       expect(sockets).toHaveLength(2);
+    });
+  });
+
+  describe("noticing a dead connection", () => {
+    const pings = (socket: FakeSocket) => socket.sent.filter((m) => m.type === "ping").length;
+
+    it("pings a quiet connection, and carries on if the server answers", () => {
+      const socket = joinFresh("abc", 1);
+      vi.advanceTimersByTime(9_999);
+      expect(pings(socket)).toBe(0);
+      vi.advanceTimersByTime(1);
+      expect(pings(socket)).toBe(1);
+
+      socket.receive({ type: "pong" });
+      for (let round = 2; round <= 6; round++) {
+        vi.advanceTimersByTime(10_000); // quiet again, so it asks again
+        expect(pings(socket)).toBe(round);
+        socket.receive({ type: "pong" });
+      }
+      expect(sockets).toHaveLength(1);
+      expect(session.status).toBe("ready");
+    });
+
+    it("gives up on a connection that doesn't answer, and reconnects without waiting for the browser", () => {
+      const socket = joinFresh("abc", 1);
+      vi.advanceTimersByTime(10_000); // ping sent
+      vi.advanceTimersByTime(4_999);
+      expect(session.status).toBe("ready");
+      vi.advanceTimersByTime(1); // 5 s of silence
+      expect(session.status).toBe("reconnecting");
+      expect(socket.closeCalls).toBe(1);
+
+      vi.advanceTimersByTime(499);
+      expect(sockets).toHaveLength(2);
+      latest().open();
+      expect(latest().sent).toEqual([{ type: "join", docId: "doc", clientId: "tab-1", lastRevision: 1 }]);
+    });
+
+    it("treats any message as proof of life, not only a pong", () => {
+      const socket = joinFresh("abc", 1);
+      vi.advanceTimersByTime(10_000); // ping sent
+      vi.advanceTimersByTime(4_000);
+      socket.receive({ type: "edit", op: [insert("X"), retain(3)] });
+      vi.advanceTimersByTime(4_000); // would have been past the deadline
+      expect(session.status).toBe("ready");
+      expect(sockets).toHaveLength(1);
+    });
+
+    it("doesn't ping a connection that is busy anyway", () => {
+      const socket = joinFresh("abc", 1);
+      for (let i = 0; i < 12; i++) {
+        vi.advanceTimersByTime(5_000);
+        socket.receive({ type: "edit", op: [retain(3 + i), insert("x")] });
+      }
+      expect(pings(socket)).toBe(0);
+    });
+
+    it("gives up on a connection attempt that never opens", () => {
+      session.start();
+      vi.advanceTimersByTime(5_000);
+      expect(sockets[0]!.closeCalls).toBe(1);
+      expect(session.status).toBe("connecting");
+      vi.advanceTimersByTime(499);
+      expect(sockets).toHaveLength(2);
+    });
+
+    it("stops waiting for an attempt that did open in time", () => {
+      session.start();
+      vi.advanceTimersByTime(4_000);
+      latest().open();
+      latest().receive({ type: "snapshot", text: "", revision: 0 });
+      vi.advanceTimersByTime(5_000); // past the connect deadline, before the first ping
+      expect(sockets).toHaveLength(1);
+      expect(latest().closeCalls).toBe(0);
+    });
+
+    it("is quiet after stop()", () => {
+      const socket = joinFresh();
+      session.stop();
+      vi.advanceTimersByTime(60_000);
+      expect(pings(socket)).toBe(0);
+      expect(sockets).toHaveLength(1);
+    });
+
+    it("loses nothing: an edit in flight on a connection that died is dealt with on rejoin", () => {
+      const socket = joinFresh("abc", 1);
+      session.edit("abcd"); // the server saves it, but the connection is dead before we hear back
+      vi.advanceTimersByTime(10_000 + 5_000);
+      expect(session.status).toBe("reconnecting");
+      vi.advanceTimersByTime(500);
+      latest().open();
+      latest().receive({
+        type: "catchup",
+        operations: [{ op: [retain(3), insert("d")], own: true }],
+        revision: 2,
+      });
+      expect(latest().edits).toEqual([]); // not sent twice
+      expect(socket.edits).toHaveLength(1);
+      expect(session.text).toBe("abcd");
     });
   });
 

@@ -41,6 +41,10 @@ describe("parseClientMessage", () => {
     expect(parseClientMessage(edit(3, op))).toEqual({ type: "edit", baseRevision: 3, op });
   });
 
+  it("accepts a ping", () => {
+    expect(parseClientMessage('{"type":"ping"}')).toEqual({ type: "ping" });
+  });
+
   it("rejects garbage", () => {
     expect(parseClientMessage("not json")).toBeNull();
     expect(parseClientMessage("42")).toBeNull();
@@ -115,6 +119,10 @@ describe("parseServerMessage", () => {
     expect(parseServerMessage(catchup([{ op: "bad", own: true }]))).toBeNull();
     expect(parseServerMessage(catchup([], -1))).toBeNull();
     expect(parseServerMessage(catchup([], 1.5))).toBeNull();
+  });
+
+  it("accepts a pong", () => {
+    expect(parseServerMessage('{"type":"pong"}')).toEqual({ type: "pong" });
   });
 
   it("accepts an ack", () => {

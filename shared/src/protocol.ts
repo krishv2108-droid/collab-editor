@@ -14,7 +14,9 @@ export type ClientMessage =
    */
   | { type: "join"; docId: string; clientId?: string; lastRevision?: number }
   /** `baseRevision` is the server revision the client had processed when it made `op`. */
-  | { type: "edit"; baseRevision: number; op: Operation };
+  | { type: "edit"; baseRevision: number; op: Operation }
+  /** "Are you there?" The server answers with a pong. A browser can't send WebSocket-level pings itself. */
+  | { type: "ping" };
 
 /** Messages the server sends to browsers. */
 export type ServerMessage =
@@ -27,6 +29,8 @@ export type ServerMessage =
   | { type: "catchup"; operations: MissedOperation[]; revision: number }
   /** Your in-flight edit was accepted. */
   | { type: "ack" }
+  /** The answer to a ping. */
+  | { type: "pong" }
   /** Someone else's edit, already rewritten to apply on top of everything you've processed. */
   | { type: "edit"; op: Operation };
 
@@ -73,6 +77,7 @@ export function parseClientMessage(raw: string): ClientMessage | null {
     }
     return join;
   }
+  if (data.type === "ping") return { type: "ping" };
   if (
     data.type === "edit" &&
     typeof data.baseRevision === "number" &&
@@ -112,6 +117,7 @@ export function parseServerMessage(raw: string): ServerMessage | null {
     return { type: "catchup", operations, revision: data.revision };
   }
   if (data.type === "ack") return { type: "ack" };
+  if (data.type === "pong") return { type: "pong" };
   if (data.type === "edit" && isOperation(data.op)) {
     return { type: "edit", op: data.op };
   }

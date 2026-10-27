@@ -46,7 +46,14 @@ export interface SessionOptions {
   listener: SessionListener;
   createSocket?: (url: string) => SocketLike;
   random?: () => number;
+  /** How long a connection may be quiet before we ask whether it is still there. */
+  heartbeatMs?: number;
+  /** How long to wait for any answer (to a ping, or to opening the connection) before giving up on it. */
+  timeoutMs?: number;
 }
+
+export const DEFAULT_HEARTBEAT_MS = 10_000;
+export const DEFAULT_TIMEOUT_MS = 5_000;
 
 const SOCKET_OPEN = 1;
 
@@ -73,16 +80,24 @@ export class DocumentSession {
   private attempt = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
+  /** Fires when it is time to ask the server whether it is still there. */
+  private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Fires if the server hasn't answered in time: the connection is dead. */
+  private deadlineTimer: ReturnType<typeof setTimeout> | null = null;
   private currentStatus: ConnectionStatus = "connecting";
 
   private readonly createSocket: (url: string) => SocketLike;
   private readonly random: () => number;
+  private readonly heartbeatMs: number;
+  private readonly timeoutMs: number;
 
   constructor(private readonly options: SessionOptions) {
     // A browser WebSocket has the same shape; the cast only smooths over its event types.
     this.createSocket =
       options.createSocket ?? ((url) => new WebSocket(url) as unknown as SocketLike);
     this.random = options.random ?? Math.random;
+    this.heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   }
 
   get text(): string {
@@ -101,6 +116,7 @@ export class DocumentSession {
   stop(): void {
     this.stopped = true;
     this.clearTimer();
+    this.clearLiveness();
     const socket = this.socket;
     this.socket = null;
     if (socket) {
@@ -134,9 +150,14 @@ export class DocumentSession {
     this.socket = socket;
     this.joined = false;
 
+    // A connection attempt that never finishes (the network is gone but the browser hasn't
+    // noticed) must not leave us waiting forever.
+    this.deadlineTimer = setTimeout(() => this.connectionDied(socket), this.timeoutMs);
+
     // Every handler ignores sockets we've already moved on from.
     socket.onopen = () => {
       if (this.socket !== socket) return;
+      this.heardFrom(socket); // it opened, so the connection works
       const join: ClientMessage = {
         type: "join",
         docId: this.options.docId,
@@ -147,14 +168,50 @@ export class DocumentSession {
     };
     socket.onmessage = (event) => {
       if (this.socket !== socket) return;
+      this.heardFrom(socket);
       this.handleMessage(socket, event.data);
     };
     socket.onclose = (event) => {
       if (this.socket !== socket) return;
       this.socket = null;
       this.joined = false;
+      this.clearLiveness();
       this.handleClose(event.code);
     };
+  }
+
+  /**
+   * Browsers hide WebSocket-level pings from pages, so we keep our own: whenever the
+   * connection has been quiet for `heartbeatMs` we send a ping, and if nothing at all comes
+   * back within `timeoutMs` we treat the connection as dead. Any message counts as proof of
+   * life, so a busy connection never needs to ping.
+   */
+  private heardFrom(socket: SocketLike): void {
+    this.clearLiveness();
+    this.heartbeatTimer = setTimeout(() => {
+      this.heartbeatTimer = null;
+      if (this.socket !== socket || socket.readyState !== SOCKET_OPEN) return;
+      const ping: ClientMessage = { type: "ping" };
+      socket.send(JSON.stringify(ping));
+      this.deadlineTimer = setTimeout(() => this.connectionDied(socket), this.timeoutMs);
+    }, this.heartbeatMs);
+  }
+
+  /** No answer in time. Waiting for the browser to notice could take minutes, so give up on this socket now. */
+  private connectionDied(socket: SocketLike): void {
+    if (this.socket !== socket) return;
+    this.socket = null;
+    this.joined = false;
+    this.clearLiveness();
+    socket.onopen = socket.onmessage = socket.onclose = null; // whatever it says from now on is ignored
+    socket.close();
+    this.handleClose(1006); // 1006 is what a browser reports for a connection that was lost
+  }
+
+  private clearLiveness(): void {
+    if (this.heartbeatTimer !== null) clearTimeout(this.heartbeatTimer);
+    if (this.deadlineTimer !== null) clearTimeout(this.deadlineTimer);
+    this.heartbeatTimer = this.deadlineTimer = null;
   }
 
   private handleMessage(socket: SocketLike, raw: unknown): void {
@@ -180,6 +237,8 @@ export class DocumentSession {
         this.markJoined();
         if (resend) this.sendEdit(resend);
         this.options.listener.onRemoteChange(this.current, toApply);
+      } else if (message.type === "pong") {
+        // Nothing to do: heardFrom already counted it as proof of life.
       } else if (message.type === "ack") {
         if (!this.sync) throw new Error("Got an ack without having a document");
         const next = this.sync.serverAck();
