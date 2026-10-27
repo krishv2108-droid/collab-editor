@@ -9,6 +9,8 @@ edit the same document at once and always converge to identical text, even when 
 cross paths on a slow network. Documents survive server restarts, and a tab whose
 connection drops keeps working offline and catches up by itself when it is back.
 
+![Two browser windows editing the same document, each showing the other's cursor](docs/two-windows.webp)
+
 ## Structure
 
 | Folder    | What it is                                                                                  |
