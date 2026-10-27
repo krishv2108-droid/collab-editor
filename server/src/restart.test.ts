@@ -63,4 +63,40 @@ describe.skipIf(!TEST_DATABASE_URL)("server with Postgres", () => {
     );
     expect(rows.map((r) => r.revision)).toEqual([1, 2, 3, 4]);
   });
+
+  it("saves snapshots as edits pile up, and loads from them after a restart", async () => {
+    const first = await createCollabServer(0, new PostgresStore(pool), { snapshotEvery: 2 });
+    const alice = await TestClient.connect(first.port);
+    alice.send({ type: "join", docId: "snapped" });
+    await alice.next(); // snapshot
+
+    const word = "hello";
+    for (const [revision, char] of [...word].entries()) {
+      const op = revision === 0 ? [insert(char)] : [retain(revision), insert(char)];
+      alice.send({ type: "edit", baseRevision: revision, op });
+      expect(await alice.next()).toEqual({ type: "ack" });
+    }
+    alice.close();
+    await first.close(); // waits for any snapshot still being saved
+
+    const { rows } = await pool.query<{
+      head_revision: number;
+      snapshot_revision: number;
+      snapshot_text: string;
+    }>("SELECT head_revision, snapshot_revision, snapshot_text FROM documents WHERE id = 'snapped'");
+    const stored = rows[0]!;
+    expect(stored.head_revision).toBe(5);
+    expect(stored.snapshot_revision).toBeGreaterThanOrEqual(2);
+    expect(stored.snapshot_text).toBe(word.slice(0, stored.snapshot_revision)); // the text at that revision
+
+    const second = await createCollabServer(0, new PostgresStore(pool), { snapshotEvery: 2 });
+    try {
+      const bob = await TestClient.connect(second.port);
+      bob.send({ type: "join", docId: "snapped" });
+      expect(await bob.next()).toEqual({ type: "snapshot", text: "hello", revision: 5 });
+      bob.close();
+    } finally {
+      await second.close();
+    }
+  });
 });

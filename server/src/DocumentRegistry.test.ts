@@ -219,4 +219,132 @@ describe("DocumentRegistry", () => {
       await expect(registry.applyEdit("bob", 0, [insert("x")])).rejects.toThrow(/not joined/);
     });
   });
+
+  describe("snapshots", () => {
+    const withSnapshots = (every: number) =>
+      new DocumentRegistry<string>(store, {
+        snapshotEvery: every,
+        onRoomFailed: (clients, error) => failures.push({ clients, error }),
+      });
+
+    /** Types `text` one character per edit, starting from a document that is `from` characters long. */
+    async function typeText(reg: DocumentRegistry<string>, client: string, text: string, from = 0) {
+      for (const [i, char] of [...text].entries()) {
+        const length = from + i;
+        await reg.applyEdit(client, length, length === 0 ? [insert(char)] : [retain(length), insert(char)]);
+      }
+    }
+
+    it("saves nothing until enough edits have piled up, then saves the full text", async () => {
+      const reg = withSnapshots(3);
+      await reg.join("doc1", "alice");
+
+      await typeText(reg, "alice", "ab");
+      await reg.flushSnapshots();
+      expect(store.snapshotCalls).toBe(0);
+
+      await typeText(reg, "alice", "c", 2);
+      await reg.flushSnapshots();
+      expect(await store.inner.load("doc1")).toEqual({
+        snapshotText: "abc",
+        snapshotRevision: 3,
+        operations: [],
+      });
+    });
+
+    it("counts from the latest snapshot, not from the start", async () => {
+      const reg = withSnapshots(3);
+      await reg.join("doc1", "alice");
+      await typeText(reg, "alice", "abc");
+      await reg.flushSnapshots();
+      await typeText(reg, "alice", "defg", 3);
+      await reg.flushSnapshots();
+
+      const stored = (await store.inner.load("doc1"))!;
+      expect(stored.snapshotRevision).toBe(6);
+      expect(stored.snapshotText).toBe("abcdef");
+      expect(stored.operations).toHaveLength(1);
+    });
+
+    it("does not hold up the acknowledgement of the edit that triggered it", async () => {
+      const reg = withSnapshots(1);
+      store.snapshotDelayMs = 50;
+      await reg.join("doc1", "alice");
+
+      await typeText(reg, "alice", "a"); // resolved, i.e. acknowledged
+      expect(store.snapshotCalls).toBe(1);
+      expect((await store.inner.load("doc1"))!.snapshotRevision).toBe(0); // still being saved
+
+      await reg.flushSnapshots();
+      expect((await store.inner.load("doc1"))!.snapshotRevision).toBe(1);
+    });
+
+    it("never runs two snapshot saves for a document at once", async () => {
+      const reg = withSnapshots(1);
+      store.snapshotDelayMs = 30;
+      await reg.join("doc1", "alice");
+
+      await typeText(reg, "alice", "abc"); // all three edits land while the first snapshot is saving
+      await reg.flushSnapshots();
+      expect(store.snapshotCalls).toBe(1);
+
+      await typeText(reg, "alice", "d", 3); // and the next edit starts a new one
+      await reg.flushSnapshots();
+      expect(store.snapshotCalls).toBe(2);
+      expect((await store.inner.load("doc1"))!.snapshotRevision).toBe(4);
+    });
+
+    it("treats a failed snapshot as harmless and tries again after a later edit", async () => {
+      const reg = withSnapshots(2);
+      await reg.join("doc1", "alice");
+      store.failNextSnapshot = true;
+
+      await typeText(reg, "alice", "ab"); // triggers the snapshot that will fail
+      await reg.flushSnapshots();
+      expect(failures).toHaveLength(0); // nobody was disconnected
+      expect(reg.documentCount).toBe(1);
+      expect((await store.inner.load("doc1"))!.snapshotRevision).toBe(0);
+
+      await typeText(reg, "alice", "c", 2); // editing carries on, and the snapshot is retried
+      await reg.flushSnapshots();
+      expect(await store.inner.load("doc1")).toEqual({
+        snapshotText: "abc",
+        snapshotRevision: 3,
+        operations: [],
+      });
+    });
+
+    it("carries on counting from the stored snapshot after a restart", async () => {
+      const first = withSnapshots(3);
+      await first.join("doc1", "alice");
+      await typeText(first, "alice", "abcd");
+      await first.flushSnapshots();
+      expect((await store.inner.load("doc1"))!.snapshotRevision).toBe(3);
+
+      const second = withSnapshots(3);
+      expect(await second.join("doc1", "carol")).toEqual({ text: "abcd", revision: 4 });
+      await typeText(second, "carol", "e", 4); // revision 5: only 2 since the snapshot
+      await second.flushSnapshots();
+      expect((await store.inner.load("doc1"))!.snapshotRevision).toBe(3);
+
+      await typeText(second, "carol", "f", 5); // revision 6: 3 since the snapshot
+      await second.flushSnapshots();
+      expect((await store.inner.load("doc1"))!.snapshotRevision).toBe(6);
+    });
+
+    it("loads exactly the same document as it would without snapshots", async () => {
+      const reg = withSnapshots(3);
+      await reg.join("doc1", "alice");
+      await typeText(reg, "alice", "helloworld");
+      await reg.flushSnapshots();
+
+      const stored = (await store.inner.load("doc1"))!;
+      expect(stored.snapshotRevision).toBeGreaterThan(0);
+      expect(stored.operations.length).toBeLessThan(10);
+      expect(await withSnapshots(3).join("doc1", "bob")).toEqual({
+        text: "helloworld",
+        revision: 10,
+      });
+    });
+  });
 });

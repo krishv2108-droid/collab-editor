@@ -14,6 +14,10 @@ export class FlakyStore implements DocumentStore {
   delayMs = 0;
   failNextLoad = false;
   failNextAppend = false;
+  snapshotCalls = 0;
+  /** Snapshots are slow independently of the other operations, so tests can catch them mid-save. */
+  snapshotDelayMs = 0;
+  failNextSnapshot = false;
 
   private pause(): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, this.delayMs));
@@ -39,7 +43,13 @@ export class FlakyStore implements DocumentStore {
     return this.inner.append(docId, revision, op);
   }
 
-  saveSnapshot(docId: string, revision: number, text: string): Promise<void> {
+  async saveSnapshot(docId: string, revision: number, text: string): Promise<void> {
+    this.snapshotCalls++;
+    await new Promise((resolve) => setTimeout(resolve, this.snapshotDelayMs));
+    if (this.failNextSnapshot) {
+      this.failNextSnapshot = false;
+      throw new Error("simulated snapshot failure");
+    }
     return this.inner.saveSnapshot(docId, revision, text);
   }
 }

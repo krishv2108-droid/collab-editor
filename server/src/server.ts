@@ -26,9 +26,14 @@ export interface CollabServer {
  * Starts the WebSocket server, keeping documents in `store`. Pass port 0 to let the OS
  * pick a free port. The caller owns the store and closes it after the server.
  */
-export function createCollabServer(port: number, store: DocumentStore): Promise<CollabServer> {
+export function createCollabServer(
+  port: number,
+  store: DocumentStore,
+  options: { snapshotEvery?: number } = {},
+): Promise<CollabServer> {
   const wss = new WebSocketServer({ port, maxPayload: MAX_MESSAGE_BYTES });
   const registry = new DocumentRegistry<WebSocket>(store, {
+    snapshotEvery: options.snapshotEvery,
     onRoomFailed(clients, error) {
       console.error(error.message);
       // Their view of the document can no longer be trusted. Disconnect them so they
@@ -91,11 +96,11 @@ export function createCollabServer(port: number, store: DocumentStore): Promise<
       }
       resolve({
         port: address.port,
-        close: () =>
-          new Promise<void>((done) => {
-            for (const client of wss.clients) client.terminate();
-            wss.close(() => done());
-          }),
+        close: async () => {
+          for (const client of wss.clients) client.terminate();
+          await new Promise<void>((done) => wss.close(() => done()));
+          await registry.flushSnapshots(); // let any snapshot being saved finish before the store closes
+        },
       });
     });
   });

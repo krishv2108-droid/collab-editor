@@ -23,9 +23,14 @@ export interface EditResult<C> {
   recipients: C[];
 }
 
+/** Save a snapshot after this many edits since the last one. */
+export const DEFAULT_SNAPSHOT_EVERY = 100;
+
 export interface RegistryOptions<C> {
   /** Called with every client of a document that had to be dropped. */
   onRoomFailed?(clients: C[], error: RoomFailedError): void;
+  /** How many edits to let pile up before saving a snapshot. Defaults to DEFAULT_SNAPSHOT_EVERY. */
+  snapshotEvery?: number;
 }
 
 /**
@@ -40,6 +45,10 @@ interface Room<C> {
   tail: Promise<unknown>;
   /** True once the room has been removed from memory; nothing more may happen in it. */
   evicted: boolean;
+  /** The revision of the newest snapshot we know is stored. Unknown until the document has loaded. */
+  lastSnapshotRevision: number | null;
+  /** True while a snapshot is being saved, so they never pile up. */
+  snapshotting: boolean;
 }
 
 /**
@@ -53,11 +62,15 @@ export class DocumentRegistry<C> {
   private readonly rooms = new Map<string, Room<C>>();
   /** Which room each client is in (or is in the middle of joining). */
   private readonly memberships = new Map<C, { room: Room<C> }>();
+  private readonly pendingSnapshots = new Set<Promise<void>>();
+  private readonly snapshotEvery: number;
 
   constructor(
     private readonly store: DocumentStore,
     private readonly options: RegistryOptions<C> = {},
-  ) {}
+  ) {
+    this.snapshotEvery = options.snapshotEvery ?? DEFAULT_SNAPSHOT_EVERY;
+  }
 
   /**
    * Puts `client` in document `docId`, loading it from the store if nobody else has it
@@ -133,9 +146,16 @@ export class DocumentRegistry<C> {
         throw this.failRoom(room, cause);
       }
       document.commit(edit); // saved, so now it is real
+      room.lastSnapshotRevision ??= document.startRevision;
+      this.maybeSaveSnapshot(room, edit.revision, edit.nextText);
 
       return { op: edit.op, recipients: [...room.clients].filter((c) => c !== client) };
     });
+  }
+
+  /** Resolves once every snapshot currently being saved has finished (or failed). */
+  async flushSnapshots(): Promise<void> {
+    await Promise.all([...this.pendingSnapshots]);
   }
 
   /** How many clients are connected to `docId` (0 if it isn't loaded). */
@@ -157,6 +177,8 @@ export class DocumentRegistry<C> {
         clients: new Set(),
         tail: Promise.resolve(),
         evicted: false,
+        lastSnapshotRevision: null,
+        snapshotting: false,
       };
       // If loading fails, forget the room so the next join tries again.
       created.document.catch(() => this.evict(created));
@@ -164,6 +186,31 @@ export class DocumentRegistry<C> {
       room = created;
     }
     return room;
+  }
+
+  /**
+   * Saves the document's full text as a snapshot once enough edits have piled up since the
+   * last one, so loading it later only has to replay a few edits. Runs in the background:
+   * the edit has already been saved, so a snapshot is only an optimization. If it fails we
+   * just log it and try again after a later edit.
+   */
+  private maybeSaveSnapshot(room: Room<C>, revision: number, text: string): void {
+    if (room.snapshotting || revision - room.lastSnapshotRevision! < this.snapshotEvery) return;
+
+    room.snapshotting = true;
+    const saving = this.store
+      .saveSnapshot(room.docId, revision, text)
+      .then(() => {
+        room.lastSnapshotRevision = revision;
+      })
+      .catch((error) => {
+        console.warn(`Could not save snapshot of "${room.docId}":`, (error as Error).message);
+      })
+      .finally(() => {
+        room.snapshotting = false;
+        this.pendingSnapshots.delete(saving);
+      });
+    this.pendingSnapshots.add(saving);
   }
 
   private async loadDocument(docId: string): Promise<ServerDocument> {

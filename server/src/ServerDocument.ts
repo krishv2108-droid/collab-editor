@@ -20,7 +20,8 @@ export interface PreparedEdit {
 export class ServerDocument {
   private currentText: string;
   private readonly history: Operation[] = [];
-  private readonly startRevision: number;
+  /** The revision this object started at: 0 for a new document, the snapshot's revision when restored. */
+  readonly startRevision: number;
 
   constructor(initialText = "", startRevision = 0) {
     this.currentText = initialText;
