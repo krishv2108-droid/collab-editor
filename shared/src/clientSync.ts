@@ -46,6 +46,11 @@ export class ClientSync {
     this.revision = revision;
   }
 
+  /** How many server operations we have processed. A reconnecting tab tells the server this. */
+  get processedRevision(): number {
+    return this.revision;
+  }
+
   get state(): SyncState {
     if (this.inflight === null) return "synchronized";
     return this.buffer === null ? "awaiting" : "awaitingWithBuffer";
