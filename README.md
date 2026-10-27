@@ -4,9 +4,10 @@ A real-time collaborative text editor, built from scratch in TypeScript. The
 conflict-resolution layer is **Operational Transformation (OT)**, implemented by
 hand: no Yjs, Automerge or ShareDB. Documents are stored in **PostgreSQL**.
 
-**Status: Phase 3 complete.** Any number of browser tabs can edit the same
-document at once and always converge to identical text, even when edits cross
-paths on a slow network. Documents survive server restarts.
+**Status: Phase 3 complete, plus automatic reconnect.** Any number of browser tabs can
+edit the same document at once and always converge to identical text, even when edits
+cross paths on a slow network. Documents survive server restarts, and a tab whose
+connection drops keeps working offline and catches up by itself when it is back.
 
 ## Structure
 
@@ -49,6 +50,29 @@ paths on a slow network. Documents survive server restarts.
 - **Snapshots** are saved in the background every 100 edits and never delay an `ack`.
 - **Storage is an interface** (`DocumentStore`) with a Postgres and an in-memory
   implementation, both checked by the same contract tests.
+
+### Reconnecting
+
+A dropped connection leaves one awkward question: the edit that was in flight when it died
+may or may not have been saved. Sending it again could apply it twice; not sending it could
+lose it. So the server and client settle it explicitly:
+
+- **Identity.** Each tab picks a random `clientId` and sends it when joining. The server
+  stores the author with every saved edit (never shown to other users).
+- **Catch-up.** A returning tab says which revision it last processed. The server answers
+  with every edit saved since, each marked `own` or not. An `own` edit is the tab's in-flight
+  edit after all, so it counts as acknowledged; anything still in flight afterwards was never
+  saved and is sent again. Other people's edits are applied exactly like live ones.
+- **Offline typing.** The editor stays usable while reconnecting. Edits pile up in the same
+  buffer used while waiting for an acknowledgement and go out once the tab has caught up.
+- **Half-dead connections.** When a tab rejoins, the server drops any older connection of the
+  same tab, so an edit still on its way over the old connection can't be saved a second time.
+- **Retrying.** Waits grow 0.5 s, 1 s, 2 s... up to 15 s, randomised so that tabs don't all
+  return at the same instant after a server restart. The wait resets only once the server
+  has answered the join.
+- **Heartbeat.** Browsers hide WebSocket pings from pages, so the client sends its own ping
+  after 10 s of quiet and gives up on the connection if nothing comes back within 5 s. The
+  server separately drops connections that stay silent for a full round.
 
 ## Requirements
 
@@ -97,16 +121,25 @@ Tests that need Postgres use `TEST_DATABASE_URL` and refuse to run against any d
 whose name doesn't contain "test". Without that variable they are skipped and everything
 else still runs.
 
-The most important test is `server/src/simulation.test.ts`: several simulated clients type
+`server/src/reconnectSimulation.test.ts` adds failures to that: the real registry, store and
+client state machine run against a simulated network that drops connections (losing
+acknowledgements for edits the server had already saved), leaves half-dead connections whose
+edits arrive late, and restarts the server. In the insert-only runs every typed character is
+unique and nothing is deleted, so a lost edit and a duplicated edit both fail the final check.
+
+The most important test of the editing logic itself is `server/src/simulation.test.ts`: several simulated clients type
 at random while messages are delivered in random order and clients join mid-session. When
 everything settles, the server and every client must hold the same text. It uses fixed
 seeds, so any failure can be reproduced exactly.
 
 ## Known limitations
 
-- A client whose connection drops must reload the page; there is no automatic reconnect.
+- Reloading the page starts a new session: typing that hadn't reached the server is lost.
+- If the server can't catch a returning tab up (for example, the database was wiped), the tab
+  takes a fresh copy of the document and what it typed while offline is discarded.
 - The `operations` table is never trimmed, so it grows forever. Snapshots keep loading fast
-  but don't reduce storage.
+  but don't reduce storage. (Catch-up after a reconnect reads this log, so trimming it would
+  need a limit on how long a tab can be away.)
 - One server process only. Running several against one database would be detected and
   refused by the revision check, but it isn't supported.
 - Other users' cursors aren't shown.
@@ -116,4 +149,5 @@ seeds, so any failure can be reproduced exactly.
 - [x] Phase 1: monorepo, WebSocket server, React client, naive sync
 - [x] Phase 2: conflict resolution with OT
 - [x] Phase 3: Postgres persistence with snapshots
-- [ ] Next: automatic reconnect, trimming old operations, showing other users' cursors
+- [x] Reconnect: offline editing, catch-up without duplicates, heartbeat
+- [ ] Next: trimming old operations, showing other users' cursors
