@@ -64,6 +64,37 @@ describe.skipIf(!TEST_DATABASE_URL)("server with Postgres", () => {
     expect(rows.map((r) => r.revision)).toEqual([1, 2, 3, 4]);
   });
 
+  it("survives a client trying to save text Postgres can't hold, without disturbing anyone else", async () => {
+    const server = await createCollabServer(0, new PostgresStore(pool));
+    try {
+      const victim = await TestClient.connect(server.port);
+      const attacker = await TestClient.connect(server.port);
+      for (const client of [victim, attacker]) {
+        client.send({ type: "join", docId: "hostile" });
+        await client.next();
+      }
+      victim.send({ type: "edit", baseRevision: 0, op: [insert("safe")] });
+      expect(await victim.next()).toEqual({ type: "ack" });
+      await attacker.next(); // the edit above
+
+      // A NUL character in an edit makes Postgres refuse the save. This used to disconnect
+      // everyone in the document (close code 1011) and the sender would retry forever.
+      attacker.send({ type: "edit", baseRevision: 1, op: [retain(4), insert("a\u0000b")] });
+      expect(await attacker.closed).toBe(1008);
+
+      victim.send({ type: "edit", baseRevision: 1, op: [retain(4), insert("!")] });
+      expect(await victim.next()).toEqual({ type: "ack" });
+      victim.close();
+    } finally {
+      await server.close();
+    }
+
+    const { rows } = await pool.query<{ revision: number }>(
+      "SELECT revision FROM operations WHERE doc_id = 'hostile' ORDER BY revision",
+    );
+    expect(rows.map((r) => r.revision)).toEqual([1, 2]);
+  });
+
   it("saves snapshots as edits pile up, and loads from them after a restart", async () => {
     const first = await createCollabServer(0, new PostgresStore(pool), { snapshotEvery: 2 });
     const alice = await TestClient.connect(first.port);

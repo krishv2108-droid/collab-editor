@@ -14,7 +14,10 @@ const server = await createCollabServer(config.port, new PostgresStore(pool));
 console.log(`Collab server listening on ws://localhost:${server.port}`);
 
 // Stop cleanly when asked to (Ctrl+C, or the dev watcher restarting us after a file change).
+let shuttingDown = false;
 async function shutdown(): Promise<void> {
+  if (shuttingDown) return; // a second Ctrl+C must not close the pool a second time
+  shuttingDown = true;
   await server.close();
   await pool.end();
   process.exit(0);

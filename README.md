@@ -148,6 +148,7 @@ and the text is still there.
 ```bash
 npm test             # run all tests once
 npm run test:watch   # re-run on every change
+npm run typecheck    # check all three packages for type errors
 ```
 
 Tests that need Postgres use `TEST_DATABASE_URL` and refuse to run against any database
@@ -166,6 +167,10 @@ network with delayed and reordered messages, dying and half-dead connections and
 restarts. At the end every user must see every other user's cursor on exactly the spot where
 that user's own cursor is.
 
+`client/src/endToEnd.test.ts` connects the real client logic to the real server over real
+WebSockets: two sessions converging and seeing each other's cursors, carrying on across a
+server restart, and stopping (instead of retrying forever) when an edit is too big.
+
 The most important test of the editing logic itself is `server/src/simulation.test.ts`: several simulated clients type
 at random while messages are delivered in random order and clients join mid-session. When
 everything settles, the server and every client must hold the same text. It uses fixed
@@ -173,6 +178,12 @@ seeds, so any failure can be reproduced exactly.
 
 ## Known limitations
 
+- There is no authentication. Anyone who can reach the server and knows (or guesses) a document
+  id can read and edit that document, so don't put anything private in it.
+- Limits: a single message may be at most 1 MiB (a bigger edit, such as pasting a huge text,
+  makes the server cut the connection and the page stops syncing until reloaded); document ids
+  are at most 200 characters; edits containing a NUL character or half of an emoji are refused,
+  because Postgres cannot store them.
 - Reloading the page starts a new session: typing that hadn't reached the server is lost.
 - If the server can't catch a returning tab up (for example, the database was wiped), the tab
   takes a fresh copy of the document and what it typed while offline is discarded.

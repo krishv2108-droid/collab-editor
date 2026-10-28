@@ -21,16 +21,37 @@ export const insert = (text: string): OpComponent => ({ type: "insert", text });
 export const del = (count: number): OpComponent => ({ type: "delete", count });
 
 /**
+ * True if `text` is something we can store and send: no NUL character and no lone half of a
+ * surrogate pair (such as half an emoji). Neither can be written to a Postgres jsonb column,
+ * so one edit carrying either would make the save fail, which takes the whole document down.
+ */
+export function isStorableText(text: string): boolean {
+  for (let i = 0; i < text.length; i++) {
+    const unit = text.charCodeAt(i);
+    if (unit === 0) return false;
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = text.charCodeAt(i + 1); // NaN at the end of the text, which fails the check
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      i++; // a well-formed pair: skip its second half
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Checks, at runtime, that something received from the network really is an
  * operation: only known piece types, whole-number counts of at least 1, and
- * non-empty insert text. (Whether it fits a particular document is checked later.)
+ * non-empty insert text that can be stored. (Whether it fits a particular document is
+ * checked later.)
  */
 export function isOperation(value: unknown): value is Operation {
   if (!Array.isArray(value)) return false;
   return value.every((piece: unknown) => {
     if (typeof piece !== "object" || piece === null) return false;
     const { type, text, count } = piece as Record<string, unknown>;
-    if (type === "insert") return typeof text === "string" && text.length > 0;
+    if (type === "insert") return typeof text === "string" && text.length > 0 && isStorableText(text);
     if (type === "retain" || type === "delete") {
       return typeof count === "number" && Number.isInteger(count) && count > 0;
     }

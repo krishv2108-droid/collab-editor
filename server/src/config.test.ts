@@ -29,4 +29,19 @@ describe("parseConfig", () => {
     expect(() => parseConfig({ DATABASE_URL, PORT: "70000" })).toThrow(/PORT/);
     expect(() => parseConfig({ DATABASE_URL, PORT: "80.5" })).toThrow(/PORT/);
   });
+
+  it("treats a blank PORT as not set, not as port 0 (which would pick a random port)", () => {
+    expect(parseConfig({ DATABASE_URL, PORT: "" }).port).toBe(8080);
+    expect(parseConfig({ DATABASE_URL, PORT: "  " }).port).toBe(8080);
+  });
+
+  it("rejects PORT values that Number() would quietly accept", () => {
+    expect(() => parseConfig({ DATABASE_URL, PORT: "8e3" })).toThrow(/PORT/);
+    expect(() => parseConfig({ DATABASE_URL, PORT: "0x1F90" })).toThrow(/PORT/);
+    expect(() => parseConfig({ DATABASE_URL, PORT: "-1" })).toThrow(/PORT/);
+  });
+
+  it("still allows port 0, to let the operating system choose (used by tests)", () => {
+    expect(parseConfig({ DATABASE_URL, PORT: "0" }).port).toBe(0);
+  });
 });

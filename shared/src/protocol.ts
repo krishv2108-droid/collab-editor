@@ -1,5 +1,5 @@
 import type { MissedOperation } from "./clientSync";
-import { isOperation, type Operation } from "./operation";
+import { isOperation, isStorableText, type Operation } from "./operation";
 import type { Selection } from "./position";
 
 /** Another user's cursor. `peer` is an anonymous id the server made up for their connection. */
@@ -9,6 +9,28 @@ export interface PeerCursor extends Selection {
 
 /** Longest clientId the server accepts. Real ones are random; this only stops abuse. */
 export const MAX_CLIENT_ID_LENGTH = 64;
+
+/** Longest document id the server accepts. */
+export const MAX_DOC_ID_LENGTH = 200;
+
+/**
+ * Document ids and client ids end up in database columns and in logs, so they are checked
+ * strictly. A client id is random (a UUID, or letters and digits); a document id may be any
+ * text that can be stored, without control characters.
+ */
+export function isDocId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= MAX_DOC_ID_LENGTH &&
+    isStorableText(value) &&
+    !/[\u0000-\u001f\u007f]/.test(value)
+  );
+}
+
+export function isClientId(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9_.:-]+$/.test(value) && value.length <= MAX_CLIENT_ID_LENGTH;
+}
 
 /** Messages the browser sends to the server. */
 export type ClientMessage =
@@ -81,16 +103,10 @@ function parseJson(raw: string): unknown {
 export function parseClientMessage(raw: string): ClientMessage | null {
   const data = parseJson(raw);
   if (!isObject(data)) return null;
-  if (data.type === "join" && typeof data.docId === "string" && data.docId.length > 0) {
+  if (data.type === "join" && isDocId(data.docId)) {
     const join: ClientMessage = { type: "join", docId: data.docId };
     if (data.clientId !== undefined) {
-      if (
-        typeof data.clientId !== "string" ||
-        data.clientId.length === 0 ||
-        data.clientId.length > MAX_CLIENT_ID_LENGTH
-      ) {
-        return null;
-      }
+      if (!isClientId(data.clientId)) return null;
       join.clientId = data.clientId;
     }
     if (data.lastRevision !== undefined) {
@@ -125,6 +141,19 @@ export function parseClientMessage(raw: string): ClientMessage | null {
     return { type: "edit", baseRevision: data.baseRevision, op: data.op };
   }
   return null;
+}
+
+/**
+ * True for a message that claims to be a join or an edit but isn't valid. parseClientMessage
+ * returns null for these (and for plain garbage). The difference matters: garbage can be
+ * ignored, but ignoring a broken edit leaves its sender waiting for an acknowledgement that
+ * will never come, so the server should cut that connection instead.
+ */
+export function isMalformedRequest(raw: string): boolean {
+  const data = parseJson(raw);
+  return (
+    isObject(data) && (data.type === "join" || data.type === "edit") && parseClientMessage(raw) === null
+  );
 }
 
 export function parseServerMessage(raw: string): ServerMessage | null {

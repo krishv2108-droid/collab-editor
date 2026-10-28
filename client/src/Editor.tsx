@@ -1,20 +1,15 @@
 import { useLayoutEffect, useRef, useState, type ChangeEvent, type CSSProperties, type SyntheticEvent } from "react";
-import { transformPosition, type PeerCursor } from "@collab/shared";
+import { transformPosition, type PeerCursor, type Selection } from "@collab/shared";
 import type { ConnectionStatus } from "./DocumentSession";
 import { PeerCursors } from "./PeerCursors";
 import { useDocumentSession } from "./useDocumentSession";
-
-interface Selection {
-  start: number;
-  end: number;
-}
 
 // What to tell the user about the connection. "ready" says nothing: no news is good news.
 const STATUS_MESSAGES: Record<ConnectionStatus, string | null> = {
   connecting: "Connecting…",
   ready: null,
   reconnecting: "Connection lost. Reconnecting… keep typing, your changes are kept and will sync.",
-  outOfSync: "This page got out of sync with the server. Reload the page.",
+  outOfSync: "The server refused a change from this page (it was invalid or too large), so syncing has stopped. Reload the page.",
 };
 
 // The textarea and the copy of its text that carries other users' cursors must look identical.
@@ -108,6 +103,7 @@ export function Editor({ docId }: { docId: string }) {
           value={text}
           onChange={handleChange}
           onSelect={handleSelect}
+          aria-label="Document text"
           onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
           disabled={!editable}
           rows={16}

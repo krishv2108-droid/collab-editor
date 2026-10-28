@@ -10,7 +10,10 @@ export interface Config {
  * clear message instead of a confusing error later. Pure, so it's easy to test.
  */
 export function parseConfig(env: Record<string, string | undefined>): Config {
-  const port = Number(env.PORT ?? 8080);
+  // A blank PORT (a line like "PORT=" in .env) means "not set", not "port 0", which would
+  // make the operating system pick a random port that nothing else knows about.
+  const rawPort = env.PORT?.trim();
+  const port = !rawPort ? 8080 : /^\d+$/.test(rawPort) ? Number(rawPort) : NaN;
   if (!Number.isInteger(port) || port < 0 || port > 65535) {
     throw new Error(`PORT must be a whole number from 0 to 65535, got "${env.PORT}"`);
   }

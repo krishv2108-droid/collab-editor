@@ -472,4 +472,50 @@ describe("collab server", () => {
       expect(await dave.next()).toEqual({ type: "peers", peers: [{ peer: expect.any(String), start: 4, end: 4 }] });
     });
   });
+  describe("malformed requests", () => {
+    it("cuts off a client whose edit can't be stored, and leaves everyone else working", async () => {
+      const victim = await join("doc1");
+      const sender = await join("doc1");
+
+      sender.send({ type: "edit", baseRevision: 0, op: [insert("a\u0000b")] }); // Postgres can't save a NUL
+      expect(await sender.closed).toBe(1008);
+
+      victim.send({ type: "edit", baseRevision: 0, op: [insert("still fine")] });
+      expect(await victim.next()).toEqual({ type: "ack" });
+    });
+
+    it("cuts off a client that sends half an emoji", async () => {
+      const client = await join("doc1");
+      client.send({ type: "edit", baseRevision: 0, op: [insert("\ud83d")] });
+      expect(await client.closed).toBe(1008);
+    });
+
+    it("cuts off a client whose join is invalid, instead of leaving it waiting for an answer", async () => {
+      const client = await connect();
+      client.send({ type: "join", docId: "x".repeat(500) });
+      expect(await client.closed).toBe(1008);
+
+      const another = await connect();
+      another.send({ type: "join", docId: "doc1", clientId: "has a space" });
+      expect(await another.closed).toBe(1008);
+    });
+
+    it("still ignores plain garbage, which can't be mistaken for a request", async () => {
+      const client = await join("doc1");
+      client.send("this is not json");
+      client.send('{"type":"unheard-of"}');
+      client.send({ type: "ping" });
+      expect(await client.next()).toEqual({ type: "pong" });
+    });
+
+    it("never lets a bad client id into a document's saved history", async () => {
+      const store = new InMemoryStore();
+      const own = await startServer(store);
+      const client = await TestClient.connect(own.port);
+      clients.push(client);
+      client.send({ type: "join", docId: "doc1", clientId: "bad\u0000id" });
+      expect(await client.closed).toBe(1008);
+      expect(await store.load("doc1")).toBeNull();
+    });
+  });
 });

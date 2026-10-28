@@ -14,6 +14,7 @@
     "dev:server": "npm run dev -w server",
     "dev:client": "npm run dev -w client",
     "test": "vitest run",
+    "typecheck": "tsc --noEmit -p shared && tsc --noEmit -p server && tsc --noEmit -p client",
     "test:watch": "vitest"
   },
   "devDependencies": {

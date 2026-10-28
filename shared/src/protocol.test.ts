@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { insert, retain } from "./operation";
-import { MAX_CLIENT_ID_LENGTH, parseClientMessage, parseServerMessage } from "./protocol";
+import {
+  isDocId,
+  isMalformedRequest,
+  MAX_CLIENT_ID_LENGTH,
+  MAX_DOC_ID_LENGTH,
+  parseClientMessage,
+  parseServerMessage,
+} from "./protocol";
 
 const edit = (baseRevision: unknown, op: unknown) =>
   JSON.stringify({ type: "edit", baseRevision, op });
@@ -172,5 +179,70 @@ describe("parseServerMessage", () => {
     const op = [insert("x")];
     expect(parseServerMessage(JSON.stringify({ type: "edit", op }))).toEqual({ type: "edit", op });
     expect(parseServerMessage('{"type":"edit","op":3}')).toBeNull();
+  });
+});
+
+describe("document ids", () => {
+  it("accepts ordinary ids, including spaces and non-English text", () => {
+    for (const id of ["doc1", "my notes", "reconnect-demo", "日本語", "a".repeat(MAX_DOC_ID_LENGTH)]) {
+      expect(isDocId(id), id).toBe(true);
+    }
+  });
+
+  it("rejects empty, over-long, control-character and unstorable ids", () => {
+    expect(isDocId("")).toBe(false);
+    expect(isDocId("a".repeat(MAX_DOC_ID_LENGTH + 1))).toBe(false);
+    expect(isDocId("a\u0000b")).toBe(false); // Postgres can't store NUL
+    expect(isDocId("a\nb")).toBe(false);
+    expect(isDocId("\ud83d")).toBe(false);
+    expect(isDocId(42)).toBe(false);
+    expect(isDocId(null)).toBe(false);
+  });
+
+  it("is enforced on join", () => {
+    const join = (docId: unknown) => JSON.stringify({ type: "join", docId });
+    expect(parseClientMessage(join("fine"))).not.toBeNull();
+    expect(parseClientMessage(join("x".repeat(MAX_DOC_ID_LENGTH + 1)))).toBeNull();
+    expect(parseClientMessage(join("a\u0000b"))).toBeNull();
+  });
+});
+
+describe("client ids", () => {
+  it("accepts UUIDs and short random ids, and rejects anything else", () => {
+    const join = (clientId: unknown) => JSON.stringify({ type: "join", docId: "d", clientId });
+    expect(parseClientMessage(join("3f2b8c1e-9d4a-4c1b-8e2f-0a1b2c3d4e5f"))).not.toBeNull();
+    expect(parseClientMessage(join("k3j2h1g0.abc_DEF:9"))).not.toBeNull();
+    expect(parseClientMessage(join("a b"))).toBeNull();
+    expect(parseClientMessage(join("a\u0000b"))).toBeNull(); // would make every save of that document fail
+    expect(parseClientMessage(join("<script>"))).toBeNull();
+    expect(parseClientMessage(join("é"))).toBeNull();
+  });
+});
+
+describe("edits with text that can't be stored", () => {
+  it("are rejected, so they never reach the database", () => {
+    const edit = (text: string) =>
+      JSON.stringify({ type: "edit", baseRevision: 0, op: [{ type: "insert", text }] });
+    expect(parseClientMessage(edit("ok"))).not.toBeNull();
+    expect(parseClientMessage(edit("a\u0000b"))).toBeNull();
+    expect(parseClientMessage(edit("\ud83d"))).toBeNull();
+  });
+});
+
+describe("isMalformedRequest", () => {
+  it("is true for a join or edit that is broken, because ignoring it would leave the sender waiting", () => {
+    expect(isMalformedRequest('{"type":"join"}')).toBe(true);
+    expect(isMalformedRequest('{"type":"join","docId":""}')).toBe(true);
+    expect(isMalformedRequest('{"type":"edit","baseRevision":-1,"op":[]}')).toBe(true);
+    expect(isMalformedRequest(JSON.stringify({ type: "edit", baseRevision: 0, op: [{ type: "insert", text: "\u0000" }] }))).toBe(true);
+  });
+
+  it("is false for valid messages, plain garbage and unknown types", () => {
+    expect(isMalformedRequest('{"type":"join","docId":"d"}')).toBe(false);
+    expect(isMalformedRequest('{"type":"ping"}')).toBe(false);
+    expect(isMalformedRequest("not json")).toBe(false);
+    expect(isMalformedRequest("42")).toBe(false);
+    expect(isMalformedRequest('{"type":"nope"}')).toBe(false);
+    expect(isMalformedRequest('{"type":"cursor","baseRevision":-1,"start":0,"end":0}')).toBe(false); // a cursor is never worth disconnecting over
   });
 });

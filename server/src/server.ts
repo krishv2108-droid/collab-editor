@@ -1,7 +1,7 @@
 import { WebSocket, WebSocketServer } from "ws";
-import { parseClientMessage, type ServerMessage } from "@collab/shared";
+import { isMalformedRequest, parseClientMessage, type ServerMessage } from "@collab/shared";
 import type { DocumentStore } from "./DocumentStore";
-import { Hub, type Connection } from "./hub";
+import { CLOSE_POLICY_VIOLATION, Hub, type Connection } from "./hub";
 
 const MAX_MESSAGE_BYTES = 1024 * 1024;
 
@@ -59,8 +59,14 @@ export function createCollabServer(
 
     socket.on("message", (data, isBinary) => {
       if (isBinary) return;
-      const message = parseClientMessage(data.toString());
-      if (!message) return;
+      const raw = data.toString();
+      const message = parseClientMessage(raw);
+      if (!message) {
+        // Garbage is ignored. A join or edit that is broken is not: ignoring it would leave
+        // the client waiting for an answer that never comes, with its typing going nowhere.
+        if (isMalformedRequest(raw)) socket.close(CLOSE_POLICY_VIOLATION, "Invalid message");
+        return;
+      }
       heardSinceLastRound.add(socket); // any message proves the connection is alive
       if (message.type === "ping") {
         // Answered at once, not queued behind a slow save: a pong only has to prove
@@ -87,6 +93,8 @@ export function createCollabServer(
         reject(new Error("Unexpected server address"));
         return;
       }
+      // From here on an error is no longer "could not start", but it must not crash the process.
+      wss.on("error", (error) => console.error("WebSocket server error:", error.message));
       resolve({
         port: address.port,
         close: async () => {

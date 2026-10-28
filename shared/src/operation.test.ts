@@ -5,6 +5,8 @@ import {
   del,
   diffToOperation,
   insert,
+  isOperation,
+  isStorableText,
   normalize,
   retain,
   targetLength,
@@ -117,5 +119,39 @@ describe("diffToOperation", () => {
         expect(applyOperation(a, op)).toBe(b);
       }
     }
+  });
+});
+
+describe("isStorableText", () => {
+  it("accepts ordinary text, newlines, tabs and whole emoji", () => {
+    for (const text of ["hello", "line\nbreak\ttab", "héllo wörld", "😀", "a😀b", "日本語"]) {
+      expect(isStorableText(text), text).toBe(true);
+    }
+  });
+
+  it("rejects a NUL character", () => {
+    expect(isStorableText("a\u0000b")).toBe(false);
+    expect(isStorableText("\u0000")).toBe(false);
+  });
+
+  it("rejects half of a surrogate pair, wherever it sits", () => {
+    expect(isStorableText("\ud83d")).toBe(false); // lone high half
+    expect(isStorableText("\ude00")).toBe(false); // lone low half
+    expect(isStorableText("x\ud83d")).toBe(false); // high half at the end
+    expect(isStorableText("\ud83dx")).toBe(false); // high half followed by something else
+    expect(isStorableText("\ude00\ud83d")).toBe(false); // halves in the wrong order
+    expect(isStorableText("😀\ude00")).toBe(false); // a whole pair, then a stray half
+  });
+});
+
+describe("isOperation and text that can't be stored", () => {
+  it("rejects an insert with a NUL or a lone surrogate, which would make saving it fail", () => {
+    expect(isOperation([{ type: "insert", text: "a\u0000b" }])).toBe(false);
+    expect(isOperation([{ type: "insert", text: "\ud83d" }])).toBe(false);
+    expect(isOperation([retain(2), { type: "insert", text: "x\ude00" }])).toBe(false);
+  });
+
+  it("accepts an insert of a whole emoji", () => {
+    expect(isOperation([insert("😀")])).toBe(true);
   });
 });

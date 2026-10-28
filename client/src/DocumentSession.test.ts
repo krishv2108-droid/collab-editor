@@ -330,6 +330,17 @@ describe("DocumentSession", () => {
       expect(sockets).toHaveLength(1);
     });
 
+    it("gives up for good when the server says a message was too big, instead of resending it forever", () => {
+      // The ws library closes a connection with 1009 when an edit passes its 1 MiB limit.
+      // The edit is still in flight, so reconnecting would send it again and be cut off again.
+      const socket = joinFresh("abc", 1);
+      session.edit("abc" + "x".repeat(2_000_000));
+      socket.drop(1009);
+      expect(session.status).toBe("outOfSync");
+      vi.advanceTimersByTime(60_000);
+      expect(sockets).toHaveLength(1);
+    });
+
     it("retries after a server-side problem (1011)", () => {
       joinFresh();
       latest().drop(1011);
@@ -518,6 +529,15 @@ describe("DocumentSession", () => {
         session.setSelection({ start: 4, end: 4 }); // the textarea reports the moved cursor
         vi.advanceTimersByTime(1000);
         expect(cursors(socket)).toHaveLength(1);
+      });
+
+      it("doesn't stall when the computer's clock is set back", () => {
+        const socket = joinFresh("hello", 1);
+        session.setSelection({ start: 1, end: 1 }); // sent at the current time
+        vi.setSystemTime(Date.now() - 60 * 60 * 1000); // the clock jumps back an hour
+        session.setSelection({ start: 2, end: 2 });
+        vi.advanceTimersByTime(60); // not an hour
+        expect(cursors(socket).map((m) => m.start)).toEqual([1, 2]);
       });
 
       it("reports it again after reconnecting, because the server forgot it", () => {

@@ -16,7 +16,8 @@ import { backoffDelay } from "./backoff";
  * - connecting:   no document yet (first visit, or the server made us start over)
  * - ready:        connected and in step with the server
  * - reconnecting: the connection dropped; we keep the document, accept typing, and retry
- * - outOfSync:    the server rejected one of our edits; the page needs a reload (final)
+ * - outOfSync:    the server refused something we sent (an invalid edit, or one over its size
+ *                 limit); retrying would only repeat it, so the page needs a reload (final)
  */
 export type ConnectionStatus = "connecting" | "ready" | "reconnecting" | "outOfSync";
 
@@ -68,11 +69,14 @@ export const DEFAULT_CURSOR_INTERVAL_MS = 50;
 
 const SOCKET_OPEN = 1;
 
-// The one close code from the server (see hub.ts) that means "reconnecting won't help".
+// Close codes that mean "reconnecting won't help": the server refused something we sent, and
+// our edit is still in flight, so reconnecting would send it again and be refused again.
+// 1008 is "policy violation" (see hub.ts), 1009 is "message too big" (sent by the ws library).
 // Notably NOT the "replaced by a newer connection" code (4001): each page load has its own
 // random clientId, so the only connection that can replace ours is an older one of ours whose
 // last message reached the server late. Reconnecting is the right answer to that.
 const CLOSE_POLICY_VIOLATION = 1008;
+const CLOSE_MESSAGE_TOO_BIG = 1009;
 
 /**
  * One tab's connection to one document: the socket, the OT state (ClientSync), the text,
@@ -203,7 +207,10 @@ export class DocumentSession {
     if (!this.cursorDirty || !this.selection || !this.sync || !socket) return;
     if (!this.joined || socket.readyState !== SOCKET_OPEN || this.sync.state !== "synchronized") return;
 
-    const wait = this.lastCursorSent + this.cursorIntervalMs - Date.now();
+    // If the clock was set back since the last message, `sinceLast` is negative: treat that as
+    // "long ago" instead of waiting for the clock to catch up.
+    const sinceLast = Date.now() - this.lastCursorSent;
+    const wait = sinceLast >= 0 ? this.cursorIntervalMs - sinceLast : 0;
     if (wait > 0) {
       this.cursorTimer ??= setTimeout(() => {
         this.cursorTimer = null;
@@ -396,8 +403,8 @@ export class DocumentSession {
     if (this.stopped) return;
     this.clearCursorTimer();
     this.clearPeers(); // we can't keep them up to date from here
-    if (code === CLOSE_POLICY_VIOLATION) {
-      // The server refused an edit of ours. Retrying with the same state could repeat it forever.
+    if (code === CLOSE_POLICY_VIOLATION || code === CLOSE_MESSAGE_TOO_BIG) {
+      // The server refused an edit of ours. Retrying with the same state would repeat it forever.
       this.setStatus("outOfSync");
     } else {
       this.setStatus(this.sync ? "reconnecting" : "connecting");
